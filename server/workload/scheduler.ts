@@ -14,7 +14,8 @@ export interface WorkloadMetadata {
   taskId?: string;
   model?: string;
   /** A later round of a turn that was already admitted. It may have run tools, so refusing it would strand half-done
-   * work; it goes ahead of new turns and is refused only when every waiting place already holds another such round. */
+   * work; it goes ahead of new requests in its lane and is refused only when every waiting place in that lane already
+   * holds another such round. A waiting new turn is passed by at most CONTINUATION_PASS_LIMIT of them. */
   continuation?: boolean;
 }
 
@@ -108,6 +109,7 @@ interface Waiter {
   meta: WorkloadMetadata;
   receivedAt: number;
   seq: number;
+  passedByRounds: number;
   grant(permit: InferencePermit): void;
   refuse(error: Error): void;
 }
@@ -137,6 +139,7 @@ const MIN_RETRY_SECONDS = 10;
 const MAX_RETRY_SECONDS = 300;
 const INITIAL_SERVICE_MS = 20_000;
 const MAX_BOTS_REPORTED = 64;
+export const CONTINUATION_PASS_LIMIT = 2;
 
 export class WorkloadScheduler {
   private readonly interactive: Waiter[] = [];
@@ -149,7 +152,7 @@ export class WorkloadScheduler {
   private closed = false;
   private readonly counters = {
     received: 0, admittedImmediately: 0, queued: 0, completed: 0, failed: 0,
-    cancelledWaiting: 0, cancelledActive: 0, unclassified: 0, modelSwitches: 0, agedBackgroundGrants: 0,
+    cancelledWaiting: 0, cancelledActive: 0, unclassified: 0, modelSwitches: 0, agedBackgroundGrants: 0, overdueNewTurnGrants: 0,
     rejected: { "queue-full": 0, "bot-share": 0, "wait-timeout": 0, displaced: 0, "background-full": 0, shutdown: 0 } as Record<BusyReason, number>,
     byClass: { interactive: 0, background: 0 } as Record<WorkloadClass, number>,
     bySource: {} as Partial<Record<WorkloadSource, number>>,
@@ -197,7 +200,7 @@ export class WorkloadScheduler {
         signal?.removeEventListener("abort", onAbort);
       };
       const waiter: Waiter = {
-        meta, receivedAt, seq: this.seq++,
+        meta, receivedAt, seq: this.seq++, passedByRounds: 0,
         grant: (permit) => { settle(); resolve(permit); },
         refuse: (error) => { settle(); reject(error); },
       };
@@ -244,7 +247,7 @@ export class WorkloadScheduler {
       })),
       interactiveWaiting: waiting(this.interactive),
       backgroundWaiting: waiting(this.background),
-      oldestBackgroundAgeMs: this.background[0] ? now - this.background[0].receivedAt : null,
+      oldestBackgroundAgeMs: this.background.length ? now - this.oldestBackgroundAt() : null,
       maxObserved: { ...this.maxObserved },
       counters: {
         ...this.counters,
@@ -272,29 +275,42 @@ export class WorkloadScheduler {
 
   private enqueue(waiter: Waiter): OllamaBusyError | null {
     const { meta } = waiter;
-    if (meta.workloadClass === "background") {
-      if (this.background.length >= this.limits.maxBackgroundWaiting) return this.refusal("background-full", meta, waiter.receivedAt);
-      this.background.push(waiter);
-    } else if (meta.continuation) {
-      if (this.interactive.length >= this.limits.maxInteractiveWaiting) {
-        const newest = [...this.interactive].reverse().find((entry) => !entry.meta.continuation);
-        if (!newest) return this.refusal("queue-full", meta, waiter.receivedAt);
-        this.remove(newest);
-        newest.refuse(this.refusal("displaced", newest.meta, newest.receivedAt));
-      }
-      const firstNew = this.interactive.findIndex((entry) => !entry.meta.continuation);
-      this.interactive.splice(firstNew === -1 ? this.interactive.length : firstNew, 0, waiter);
+    const background = meta.workloadClass === "background";
+    const lane = background ? this.background : this.interactive;
+    const capacity = background ? this.limits.maxBackgroundWaiting : this.limits.maxInteractiveWaiting;
+    const full: BusyReason = background ? "background-full" : "queue-full";
+    if (meta.continuation) {
+      const refused = this.enqueueRound(lane, waiter, capacity, full);
+      if (refused) return refused;
     } else {
-      if (this.interactive.length >= this.limits.maxInteractiveWaiting) return this.refusal("queue-full", meta, waiter.receivedAt);
-      const sameBot = this.interactive.filter((entry) => !entry.meta.continuation && this.fairnessKey(entry.meta) === this.fairnessKey(meta)).length;
-      if (sameBot >= this.limits.maxWaitingPerBot) return this.refusal("bot-share", meta, waiter.receivedAt);
-      this.interactive.push(waiter);
+      if (lane.length >= capacity) return this.refusal(full, meta, waiter.receivedAt);
+      if (!background) {
+        const sameBot = lane.filter((entry) => this.fairnessKey(entry.meta) === this.fairnessKey(meta)).length;
+        if (sameBot >= this.limits.maxWaitingPerBot) return this.refusal("bot-share", meta, waiter.receivedAt);
+      }
+      lane.push(waiter);
     }
     this.counters.queued += 1;
     this.maxObserved.interactiveWaiting = Math.max(this.maxObserved.interactiveWaiting, this.interactive.length);
     this.maxObserved.backgroundWaiting = Math.max(this.maxObserved.backgroundWaiting, this.background.length);
     this.emit("request_queued", meta, { queueDepth: { interactive: this.interactive.length, background: this.background.length } });
     return null;
+  }
+
+  private enqueueRound(lane: Waiter[], waiter: Waiter, capacity: number, full: BusyReason): OllamaBusyError | null {
+    if (lane.length >= capacity) {
+      const newest = lane.findLast((entry) => !entry.meta.continuation);
+      if (!newest) return this.refusal(full, waiter.meta, waiter.receivedAt);
+      this.remove(newest);
+      newest.refuse(this.refusal("displaced", newest.meta, newest.receivedAt));
+    }
+    const firstNew = lane.findIndex((entry) => !entry.meta.continuation);
+    lane.splice(firstNew === -1 ? lane.length : firstNew, 0, waiter);
+    return null;
+  }
+
+  private oldestBackgroundAt(): number {
+    return Math.min(...this.background.map((waiter) => waiter.receivedAt));
   }
 
   private fairnessKey(meta: WorkloadMetadata) {
@@ -310,13 +326,23 @@ export class WorkloadScheduler {
   }
 
   private nextWaiter(): { waiter: Waiter; aged: boolean } | null {
-    const oldestBackground = this.background[0];
-    const aged = Boolean(oldestBackground && this.interactive.length && this.limits.backgroundAgingMs !== null && !this.lastGrantAged
-      && this.now() - oldestBackground.receivedAt >= this.limits.backgroundAgingMs);
+    const aged = Boolean(this.background.length && this.interactive.length && this.limits.backgroundAgingMs !== null && !this.lastGrantAged
+      && this.now() - this.oldestBackgroundAt() >= this.limits.backgroundAgingMs);
     if (aged) return { waiter: this.background.shift()!, aged: true };
-    if (this.interactive.length) return { waiter: this.interactive.shift()!, aged: false };
+    if (this.interactive.length) return { waiter: this.nextInteractive(), aged: false };
     if (this.background.length) return { waiter: this.background.shift()!, aged: false };
     return null;
+  }
+
+  private nextInteractive(): Waiter {
+    const overdue = this.interactive.find((entry) => !entry.meta.continuation && entry.passedByRounds >= CONTINUATION_PASS_LIMIT);
+    const waiter = overdue ?? this.interactive[0]!;
+    this.remove(waiter);
+    if (overdue) this.counters.overdueNewTurnGrants += 1;
+    if (waiter.meta.continuation) {
+      for (const entry of this.interactive) if (!entry.meta.continuation) entry.passedByRounds += 1;
+    }
+    return waiter;
   }
 
   private dispatch() {

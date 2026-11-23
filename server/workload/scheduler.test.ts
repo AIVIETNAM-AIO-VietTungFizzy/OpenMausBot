@@ -276,3 +276,106 @@ describe("configuration", () => {
     expect(agingMs("whenever")).toBe(120_000);
   });
 });
+
+describe("fairness under bursts", () => {
+  function driven(limits: Partial<SchedulerLimits> = {}) {
+    const { scheduler, advance } = fixture(limits);
+    const order: string[] = [];
+    const states = new Map<string, ReturnType<typeof track>>();
+    const add = (meta: WorkloadMetadata) => {
+      const state = track(scheduler.acquire(meta), order);
+      states.set(meta.requestId, state);
+      return state;
+    };
+    const finishRunning = async () => {
+      states.get(order.at(-1)!)!.permit!.release("completed");
+      await flush();
+    };
+    return { scheduler, advance, order, add, finishRunning };
+  }
+
+  it("serves a waiting new turn after two later rounds of other turns went ahead of it", async () => {
+    const { order, add, finishRunning } = driven();
+    add(ask("a", { requestId: "a-1" }));
+    add(ask("c", { requestId: "c-2", continuation: true }));
+    add(ask("b", { requestId: "b-1" }));
+    await flush();
+    await finishRunning();
+    add(ask("a", { requestId: "a-2", continuation: true }));
+    await finishRunning();
+    add(ask("c", { requestId: "c-3", continuation: true }));
+    await finishRunning();
+    expect(order).toEqual(["a-1", "c-2", "a-2", "b-1"]);
+    await finishRunning();
+    expect(order.at(-1)).toBe("c-3");
+  });
+
+  it("counts a bot's waiting later round toward its one waiting place", async () => {
+    const { scheduler, add } = driven();
+    add(ask("a"));
+    const round = add(ask("b", { continuation: true }));
+    const fresh = add(ask("b", { threadId: "another-thread" }));
+    const other = add(ask("c"));
+    await flush();
+    expect(round.error).toBeUndefined();
+    expect(fresh.error).toMatchObject({ reason: "bot-share" });
+    expect(other.error).toBeUndefined();
+    expect(scheduler.interactiveDepth).toBe(2);
+  });
+
+  it("keeps a background turn's later round when the background lane is full, in place of the newest new job", async () => {
+    const { scheduler, order, add, finishRunning } = driven({ maxBackgroundWaiting: 2, backgroundAgingMs: null });
+    add(ask("a", { requestId: "person" }));
+    const older = add(background("x", { requestId: "job-x" }));
+    const newer = add(background("y", { requestId: "job-y" }));
+    const round = add(background("z", { requestId: "round-z", continuation: true }));
+    await flush();
+    expect(newer.error).toMatchObject({ reason: "displaced" });
+    expect(older.error).toBeUndefined();
+    expect(round.error).toBeUndefined();
+    expect(scheduler.backgroundDepth).toBe(2);
+    await finishRunning();
+    await finishRunning();
+    expect(order).toEqual(["person", "round-z", "job-x"]);
+  });
+
+  it("refuses a background later round only when every background place holds another later round", async () => {
+    const { add } = driven({ maxBackgroundWaiting: 2 });
+    add(ask("a"));
+    add(background("x", { continuation: true }));
+    add(background("y", { continuation: true }));
+    const third = add(background("z", { continuation: true }));
+    await flush();
+    expect(third.error).toMatchObject({ reason: "background-full" });
+  });
+
+  it("ages the background lane by its oldest request, whichever goes first inside it", async () => {
+    const { scheduler, advance, order, add, finishRunning } = driven({ backgroundAgingMs: 10_000 });
+    add(ask("a", { requestId: "first" }));
+    add(background("x", { requestId: "old-job" }));
+    advance(10_000);
+    add(background("z", { requestId: "round-z", continuation: true }));
+    add(ask("b", { requestId: "person" }));
+    await flush();
+    expect(scheduler.snapshot().oldestBackgroundAgeMs).toBe(10_000);
+    await finishRunning();
+    expect(order).toEqual(["first", "round-z"]);
+  });
+
+  it("never lets a stale permit's late release free the slot of the request that followed it", async () => {
+    const { scheduler } = fixture();
+    const first = track(scheduler.acquire(ask("a")), []);
+    const second = track(scheduler.acquire(ask("b")), []);
+    const third = track(scheduler.acquire(ask("c")), []);
+    await flush();
+    first.permit!.release("completed");
+    await flush();
+    expect(second.permit).toBeDefined();
+    expect(first.permit!.release("completed")).toBe(false);
+    expect(first.permit!.release("cancelled")).toBe(false);
+    await flush();
+    expect(scheduler.activeCount).toBe(1);
+    expect(third.permit).toBeUndefined();
+    expect(scheduler.snapshot().counters).toMatchObject({ completed: 1, cancelledActive: 0 });
+  });
+});
