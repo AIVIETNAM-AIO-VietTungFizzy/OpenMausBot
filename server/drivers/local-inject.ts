@@ -68,6 +68,12 @@ export function encodeInjectId(host: string, model: string): string {
 const isOllamaHost = (host: string) => host === "ollama" || host === "local_ollama";
 const hostOrigin = (host: LocalHost) => host.baseUrl.replace(/\/v1\/?$/, "");
 
+/** The Ollama API a CLI engine's injected model id sends to straight from the engine's own process, or null. */
+export function injectedOllamaUrl(id: string | null | undefined): string | null {
+  const host = decodeInjectId(id)?.host;
+  return host && isOllamaHost(host) ? HOST_BY_ID.get(host)!.baseUrl : null;
+}
+
 export function decodeInjectId(id: string | null | undefined): { host: string; model: string } | null {
   if (!id) return null;
   const sep = id.indexOf(INJECT_SEP);

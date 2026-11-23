@@ -1,3 +1,5 @@
+import { hostname, networkInterfaces } from "node:os";
+import { isLoopback } from "../provider-key-check.ts";
 import { schedulerEnabled, schedulerLimits } from "./config.ts";
 import { WorkloadScheduler, type SchedulerEvent } from "./scheduler.ts";
 
@@ -6,12 +8,25 @@ const instanceOrigins = new Map<string, string>();
 
 const logEvent = (event: SchedulerEvent) => console.info(`[omb-scheduler] ${JSON.stringify(event)}`);
 
-/** One scheduler per Ollama origin for the whole server process: every bot and every engine instance that sends to the
- * same origin shares its slot. The server lease keeps one process per data directory. */
+const SAME_MACHINE_KEY_HOST = "127.0.0.1";
+const UNSPECIFIED = new Set(["0.0.0.0", "::"]);
+
+function onThisMachine(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (isLoopback(bare) || UNSPECIFIED.has(bare)) return true;
+  const own = hostname().toLowerCase();
+  if (bare === own || bare === `${own.replace(/\.local$/, "")}.local`) return true;
+  return Object.values(networkInterfaces()).some((addresses) => addresses?.some((address) => address.address.toLowerCase() === bare));
+}
+
+/** One scheduler per Ollama server for the whole server process: every bot and every engine instance that sends to the
+ * same server shares its slot, whichever name for this machine its URL uses. The server lease keeps one process per data
+ * directory. */
 export function schedulerKey(apiUrl: string): string | null {
   try {
     const url = new URL(apiUrl);
-    return url.origin.toLowerCase();
+    const host = onThisMachine(url.hostname) ? SAME_MACHINE_KEY_HOST : url.hostname.toLowerCase();
+    return `${url.protocol}//${host}${url.port ? `:${url.port}` : ""}`;
   } catch {
     return null;
   }

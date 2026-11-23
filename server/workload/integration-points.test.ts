@@ -51,7 +51,8 @@ describe("classification at trusted boundaries", () => {
 
 describe("workload diagnostics route", () => {
   const jobs = new BackgroundJobs(":memory:", { capacity: 5, maxAttempts: 2 });
-  const routes = createWorkloadRoutes({ snapshots: () => ({ enabled: true, schedulers: [] }), jobs, cancelJob: async () => false });
+  const bypass = [{ botId: "cli-bot", instanceId: "claude", origin: "http://127.0.0.1:11434", sharesGovernedOrigin: true }];
+  const routes = createWorkloadRoutes({ snapshots: () => ({ enabled: true, schedulers: [] }), ungoverned: () => bypass, jobs, cancelJob: async () => false });
   const call = async (auth: RequestAuth, method: string, path: string) => {
     const response: { status?: number; body?: unknown } = {};
     const res = { setHeader() {} } as never;
@@ -65,7 +66,7 @@ describe("workload diagnostics route", () => {
   const client: RequestAuth = { kind: "session", session: {} as never, via: "bearer", scopes: ["client"] };
 
   it("answers the owner and refuses everyone else", async () => {
-    expect(await call(owner, "GET", "/api/workload")).toMatchObject({ status: 200, body: { enabled: true, backgroundJobs: { counts: { queued: 0 } } } });
+    expect(await call(owner, "GET", "/api/workload")).toMatchObject({ status: 200, body: { enabled: true, ungoverned: bypass, backgroundJobs: { counts: { queued: 0 } } } });
     expect(await call(service, "GET", "/api/workload")).toMatchObject({ status: 403 });
     expect(await call(client, "GET", "/api/workload")).toMatchObject({ status: 403 });
     expect((await call(owner, "GET", "/api/other")).out).toBe(PASS);

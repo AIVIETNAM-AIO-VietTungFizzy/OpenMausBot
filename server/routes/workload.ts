@@ -4,6 +4,7 @@ import { PASS, type RouteHandler } from "./table.ts";
 
 export interface WorkloadRouteDeps {
   snapshots(): unknown;
+  ungoverned(): unknown[];
   jobs: BackgroundJobs | null;
   /** Cancels the job's own work (a routine run) so the ledger settles through it. */
   cancelJob(job: BackgroundJob): Promise<boolean>;
@@ -22,6 +23,7 @@ export function createWorkloadRoutes(deps: WorkloadRouteDeps): RouteHandler {
     if (method === "GET" && path === "/api/workload") {
       return json(res, 200, {
         ...(deps.snapshots() as Record<string, unknown>),
+        ungoverned: deps.ungoverned(),
         backgroundJobs: deps.jobs ? { counts: deps.jobs.counts(), oldestQueuedAgeMs: deps.jobs.oldestQueuedAgeMs(), refusedFull: deps.jobs.refusedFull } : null,
       });
     }
