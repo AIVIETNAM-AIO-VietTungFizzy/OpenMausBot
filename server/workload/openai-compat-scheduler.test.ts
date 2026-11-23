@@ -270,6 +270,26 @@ describe("timeouts", () => {
     expect(await outcome("thread-1")).toMatchObject({ ok: true, text: "hello" });
     expect(schedulerSnapshots().schedulers[0]!.timings.interactiveWait.maxMs).toBeGreaterThanOrEqual(650);
   }, 15_000);
+
+  it("still stops a model that goes silent once admitted, releases its slot as failed and serves the next request", async () => {
+    vi.stubEnv("OPENMAUS_OPENAI_COMPAT_IDLE_TIMEOUT_MS", "1000");
+    const { fake, inst, outcome } = await setup();
+    await inst.adapter.sendTurn(turn(0));
+    await inst.adapter.sendTurn(turn(1));
+    await fake.waitForHeld(1);
+    const silent = await outcome("thread-0");
+    expect(silent.ok).toBe(false);
+    await until(() => fake.closed >= 1);
+    await fake.waitForHeld(2);
+    fake.release();
+    fake.release();
+    expect(await outcome("thread-1")).toMatchObject({ ok: true, text: "hello" });
+    expect(fake.maxInFlight).toBe(1);
+    const [snapshot] = schedulerSnapshots().schedulers;
+    expect(snapshot!.counters).toMatchObject({ failed: 1, completed: 1, cancelledActive: 0 });
+    expect(snapshot!.timings.interactiveWait.maxMs).toBeGreaterThanOrEqual(950);
+    expect(snapshot!.active).toEqual([]);
+  }, 15_000);
 });
 
 describe("isolation", () => {
