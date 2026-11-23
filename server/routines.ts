@@ -256,7 +256,7 @@ export interface RoutineManagerOptions {
     threadId: string,
     outcome?: { status: "stopped" | "limit-reached"; detail: string },
   ) => Promise<void>;
-  onRunChanged?: (run: RoutineRun) => void;
+  onRunChanged?: (run: RoutineRun) => void; admitBackground?: (run: RoutineRun) => boolean;
   onRunFailed?: (run: RoutineRun, alert?: RoutineAlert | null) => void;
   onRunDeferred?: (run: RoutineRun, alert?: RoutineAlert) => void;
   /** A run a restart cut off, before it starts again or fails: its old turn's work must not resume as well. */
@@ -1107,7 +1107,7 @@ export class RoutineManager {
         }
         const sameRoutineWorking = triggerSource === "schedule" && this.runs.some(other =>
           other.id !== run.id && other.routineId === run.routineId && ["running", "waiting"].includes(other.status));
-        const state = sameRoutineWorking ? "busy" : this.targetState(run);
+        const target = sameRoutineWorking ? "busy" : this.targetState(run), state = target === "ready" && this.options.admitBackground?.(cloneRun(run)) === false ? "busy" : target;
         if (state === "busy") {
           if (run.deferredAt == null) {
             run.deferredAt = now;

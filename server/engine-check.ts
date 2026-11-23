@@ -42,7 +42,7 @@ export function checkEngine(instance: CheckableEngine, options: { timeoutMs?: nu
     }, timeoutMs);
     timer.unref?.();
     // Wrapped so a call that throws synchronously fails the check too.
-    new Promise<string>((answer) => answer(call.call(instance, PROMPT, { timeoutMs, signal: stop.signal })))
+    new Promise<string>((answer) => answer(call.call(instance, PROMPT, { timeoutMs, signal: stop.signal, workload: { workloadClass: "interactive", source: "setup-check", taskId: "engine-check" } })))
       .then((answer): EngineCheck => answer.trim() ? { ok: true } : { ok: false, error: `${name} answered with nothing. Check again in a minute.` },
         (error): EngineCheck => ({ ok: false, error: engineCheckError(name, error instanceof Error ? error.message : String(error)) }))
       .then((result) => {

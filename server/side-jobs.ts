@@ -1,6 +1,7 @@
 // Privacy invariants: the helper model is unset by default, never replaces an engine that can write the job itself, and
 // never writes for a bot whose own engine is disallowed or whose helperModel switch is anything but absent or true.
 import { randomUUID } from "node:crypto";
+import { classifiedCall, sideJobWorkload } from "./workload/classify.ts";
 import { z } from "zod";
 
 import { helperModelAllowed } from "../shared/wire.ts";
@@ -189,7 +190,9 @@ export function createSideJobs(deps: SideJobsDeps): SideJobs {
       if (!bot || !own || deps.refusal(own)) return null;
       // The review's changes are written with the bot's own skill tools, whoever read the conversation.
       if (job === "skill-review" && own.adapter.capabilities.agentsMcp !== true) return null;
-      const call = ownCall(job, own);
+      const workload = sideJobWorkload(job, bot.id);
+      const plain = ownCall(job, own);
+      const call = plain && classifiedCall(plain, workload);
       if (call) {
         // The summary belongs to a turn that already passed the spend limit and is not booked on its own.
         if (job === "compaction") return { via: "engine", generateText: call };
@@ -203,7 +206,7 @@ export function createSideJobs(deps: SideJobsDeps): SideJobs {
       if (!helperModelAllowed(bot)) return null;
       const helper = usableHelper();
       if (!helper) return null;
-      return { via: "helper", generateText: booked(job, bot, helper.instance, helper.call, { kind: "helper", botId: bot.id, job }, () => (helper.model ? { model: helper.model } : {})) };
+      return { via: "helper", generateText: booked(job, bot, helper.instance, classifiedCall(helper.call, workload), { kind: "helper", botId: bot.id, job }, () => (helper.model ? { model: helper.model } : {})) };
     },
   };
 }

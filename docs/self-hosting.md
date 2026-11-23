@@ -1411,6 +1411,23 @@ the bot then answered. With the loop guard on, set `loopGuard.correctiveRounds`
 that many times first; the turn counts as done only if the tools it runs after
 that succeed. A tool call that was denied is never sent back.
 
+## Sharing one Ollama between many bots
+
+When many bots use one Ollama server that runs one reply at a time
+(`OLLAMA_NUM_PARALLEL=1`), the server can admit those requests itself instead
+of letting them pile up inside Ollama, where they wait silently until the reply
+timeout ends them. It is off by default. Set
+`OPENMAUS_OLLAMA_SCHEDULER_ENABLED=1` in the server's environment and restart it.
+
+With it on, at most one request at a time goes to each Ollama origin, two
+requests a person is waiting on may wait behind it, and a third gets an
+immediate "the local model is busy" notice with a time to try again. Routine
+runs and other bot work wait in a separate background queue and start when no
+person is waiting. Only engine instances whose server answers as Ollama are
+affected; every other provider is untouched. See
+[ollama-workload-scheduler.md](ollama-workload-scheduler.md) for the settings,
+the queue rules and the `/api/workload` diagnostics.
+
 ## A turn that goes silent
 
 The server stops a turn that has sent it nothing for 20 minutes

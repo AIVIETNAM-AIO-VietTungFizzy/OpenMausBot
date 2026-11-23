@@ -5,6 +5,7 @@ import { buildTurnDigest, digestTools } from "./digest.ts";
 import { stopCause } from "./drivers/engine-errors.ts";
 import type { TurnEvidence } from "./runtime/types.ts";
 import type { Message } from "./store.ts";
+import { isModelBusy } from "./workload/busy-notice.ts";
 
 const REASON_CHARS = 600;
 
@@ -15,7 +16,7 @@ export interface TurnStop {
   cause?: string;
   error?: string;
   /** The engine's own flags on that error (a setup or credit refusal, a stall, a usage limit and its reset). */
-  flags?: Pick<RuntimeError, "setup" | "stalled" | "trialCredit" | "limitResetsAt" | "limit">;
+  flags?: Pick<RuntimeError, "setup" | "stalled" | "trialCredit" | "limitResetsAt" | "limit"> & { modelBusy?: true };
   handoffPath?: string;
 }
 
@@ -35,7 +36,8 @@ export class TurnStops {
     else stop.error = error;
     if (event.type === "runtime.error") {
       const { setup, stalled, trialCredit, limitResetsAt, limit } = event;
-      if (setup || stalled || trialCredit || limitResetsAt || limit) stop.flags = { setup, stalled, trialCredit, limitResetsAt, limit };
+      const modelBusy = isModelBusy(event.text);
+      if (setup || stalled || trialCredit || limitResetsAt || limit || modelBusy) stop.flags = { setup, stalled, trialCredit, limitResetsAt, limit, ...(modelBusy ? { modelBusy: true as const } : {}) };
     }
   }
 

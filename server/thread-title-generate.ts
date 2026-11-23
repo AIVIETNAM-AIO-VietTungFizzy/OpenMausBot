@@ -1,6 +1,7 @@
 // Generated thread titles, on when features.llmThreadTitles is: the engine's one-shot text call, given 10 seconds, its
 // reply cleaned to a title or null.
 import type { AppConfig } from "./config.ts";
+import type { TurnWorkload } from "./contracts.ts";
 import { titleFromLlm } from "./store.ts";
 import { threadTitlePrompt, type ThreadTitleSource } from "./thread-title.ts";
 
@@ -9,7 +10,7 @@ export function llmThreadTitlesEnabled(cfg: Pick<AppConfig, "features">): boolea
 }
 
 export async function generateThreadTitle(
-  provider: { generateText?: (prompt: string, options?: { signal?: AbortSignal }) => Promise<string> },
+  provider: { generateText?: (prompt: string, options?: { signal?: AbortSignal; workload?: TurnWorkload }) => Promise<string> },
   text: string,
   source: ThreadTitleSource = "first-message",
 ): Promise<string | null> {
@@ -18,7 +19,7 @@ export async function generateThreadTitle(
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const reply = await Promise.race([
-      provider.generateText!(prompt, { signal: expiry.signal }),
+      provider.generateText!(prompt, { signal: expiry.signal, workload: { workloadClass: "background", source: "helper", taskId: "thread-title" } }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           expiry.abort();

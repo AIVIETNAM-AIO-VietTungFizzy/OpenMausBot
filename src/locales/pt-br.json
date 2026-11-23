@@ -9476,6 +9476,7 @@
   "chat.notice.acpModelFallback": "{displayName} não oferece mais {wanted}, então esta conversa está usando {fallback}. Para não ver mais este aviso, escolha outro modelo para este bot.",
   "chat.notice.codexActionMayHaveRun": "{message} Uma ferramenta pode ter executado uma ação. Confira os efeitos antes de tentar novamente.",
   "chat.notice.modelServerStoppedAnswering": "O servidor de modelo em {host} parou de responder, então a resposta foi interrompida.",
+  "chat.notice.modelBusy": "O modelo local está ocupado com pedidos de outros bots, então esta mensagem não foi enviada a ele. Tente novamente em cerca de {seconds} segundos.",
   "chat.notice.piModelNotConfirmed": "O Pi não confirmou o modelo selecionado",
   "serverError.install.invalidDetails": "Os dados de instalação de {name} são inválidos. Nada foi baixado.",
   "serverError.install.versionGone": "Esta versão de {name} não está mais disponível para baixar. Atualize o OpenMausBot e tente novamente.",

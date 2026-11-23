@@ -6,6 +6,8 @@ import { lmStudioV1Catalog } from "./local-inject.ts";
 import { isContextName, isOllama, serveWithWindow } from "./ollama-context.ts";
 import { isOllamaServer, OLLAMA_PLACEHOLDER_KEY, ollamaOrigin, ollamaUnavailable, onOllamaPort, probeOllama, type OllamaModel, type OllamaStatus } from "./ollama.ts";
 import { createOpenAIChatRuntime } from "./openai-chat.ts";
+import { schedulerEnabled } from "../workload/config.ts";
+import { registerInstanceOrigin, sharedScheduler } from "../workload/registry.ts";
 import {
   freeDefault, freeFallbackCatalog, freeLabel, freeToolModels, freeToolsFirst, isOpenRouterOrigin, openRouterFreeTier,
   withOpenRouterTurns, type OpenRouterModelRow,
@@ -340,11 +342,16 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       if (option) option.contextWindow = served.window;
       return served.model;
     } : undefined;
+    const admission = origin && schedulerEnabled()
+      ? async () => await isOllama(origin) ? sharedScheduler(config.url) : null
+      : undefined;
+    if (admission) registerInstanceOrigin(input.instanceId, config.url);
 
     const runtime = createOpenAIChatRuntime({
       input,
       driverKind: DRIVER_KIND,
       ...(servedModel ? { servedModel } : {}),
+      ...(admission ? { admission } : {}),
       apiKey,
       apiUrl: config.url,
       tools: config.tools,

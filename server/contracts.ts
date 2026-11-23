@@ -1,6 +1,7 @@
 // Ported from upstream's provider contracts with Promises for Effect and listeners for Stream; shapes and names are kept.
 
 import type { ApprovalMode } from "../shared/approval-mode.ts";
+import type { WorkloadClass, WorkloadSource } from "./workload/types.ts";
 import type { ToolIdentity, ToolScope } from "../shared/tool-scope.ts";
 import type { EffortLevel } from "../shared/wire.ts";
 import type {
@@ -121,8 +122,20 @@ export type InstanceConfigMap = Record<InstanceId, InstanceConfig>;
 export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavailable";
 
 // Sessions start implicitly on the first turn; resumeCursor carries the provider-native continuation (e.g. a Claude session id).
+/** Whether a person is waiting on the reply. Only server code that starts the work sets it, never a request body. */
+export interface TurnWorkload {
+  workloadClass: WorkloadClass;
+  source: WorkloadSource;
+  botId?: string;
+  threadId?: string;
+  taskId?: string;
+}
+
 export interface SendTurnInput {
   threadId: ThreadId;
+  /** Set by the harness where the turn starts; a driver that admits requests to a shared model server reads it.
+   * Absent counts as interactive. */
+  workload?: TurnWorkload;
   /** Drivers namespace process-level resources (broker socket, CLI session) by botId too: threadIds may coincide across bots. */
   botId?: string;
   text: string;
@@ -528,6 +541,8 @@ export interface TextGenerationUsage {
 
 export interface TextGenerationOptions {
   signal?: AbortSignal;
+  /** Who waits on this call; absent counts as interactive. */
+  workload?: TurnWorkload;
   onUsage?: (usage: TextGenerationUsage) => void;
   /** One of this instance's models instead of the driver's quick-call choice: the helper model setting, and the setup
    * card's quick model (side-jobs.ts). */

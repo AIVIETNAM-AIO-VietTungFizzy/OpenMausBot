@@ -102,6 +102,7 @@ export const CHAT_NOTICE = {
   "chat.notice.acpModelFallback": "{displayName} no longer offers {wanted}, so this conversation uses {fallback}. Choose another model for this bot to stop seeing this.",
   "chat.notice.codexActionMayHaveRun": "{message} A tool action may have run. Check its effects before trying again.",
   "chat.notice.modelServerStoppedAnswering": "The model server at {host} stopped answering, so the reply was stopped.",
+  "chat.notice.modelBusy": "The local model is busy with other bots' requests, so this message was not sent to it. Try again in about {seconds} seconds.",
   "chat.notice.piModelNotConfirmed": "Pi did not confirm the selected model",
   "chat.notice.waitingApprovalElsewhere": "Waiting on your approval in @{name}",
   "chat.notice.waitingAnswerElsewhere": "Waiting on your answer in @{name}",

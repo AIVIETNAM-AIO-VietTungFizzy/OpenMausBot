@@ -13,6 +13,7 @@ import type { Routine, RoutineRun } from "./routines.ts";
 import { codedLine, fittedLine, type RoutineLine, type RoutineLineKey } from "./routine-lines.ts";
 import { hostTimeZone } from "./turn-clock.ts";
 import { classifyContinuable } from "./turn-continuation.ts";
+import { isModelBusy } from "./workload/busy-notice.ts";
 
 export type RoutineOwnerCause = "signed_out" | "credits" | "usage_limit" | "setup";
 
@@ -35,6 +36,9 @@ export interface RoutineFailureFacts {
   text?: ServerText;
   /** The turn's reply came back; only a step it ran failed or wasn't allowed (the runtime error's `partial`). */
   partial?: boolean;
+  /** The shared model server's admission refused the request before it reached the model: busy for now, and an
+   * immediate second start would only meet the same full queue. */
+  modelBusy?: boolean;
 }
 
 export type RoutineFailureClass =
@@ -86,7 +90,7 @@ const FIRST_START: Record<RoutineRetryCause, string> = {
 /** Any failure gets one automatic retry, except a stall the turn watchdog stopped (its Chief hears instead), a
  * stop someone pressed or typed, a refusal, and a spent cap. Routine runs and teammate threads both judge by this. */
 export function classifyRoutineFailure(failure: string, facts: RoutineFailureFacts = {}): RoutineFailureClass {
-  if (facts.cause === "busy") return { kind: "busy" };
+  if (facts.cause === "busy" || facts.modelBusy || isModelBusy(facts.text)) return { kind: "busy" };
   if (facts.cause === "stalled" || facts.cause === "cap") return { kind: "final" };
   if (facts.stopReason && NOT_RETRIED_STOPS.has(facts.stopReason)) return { kind: "final" };
   if (classifyContinuable(facts.stopReason, failure) === "cap") return { kind: "final" };
