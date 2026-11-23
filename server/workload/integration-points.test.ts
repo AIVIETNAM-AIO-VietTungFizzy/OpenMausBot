@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { classifyError } from "../drivers/retry.ts";
+import { signedOutStop } from "../host/limit-takeover.ts";
 import { classifyRoutineFailure, retriesTeammateThread } from "../routine-recovery.ts";
+import { classifyContinuable } from "../turn-continuation.ts";
 import { TurnStops } from "../turn-outcome.ts";
 import type { RequestAuth } from "../request-auth.ts";
 import { createWorkloadRoutes } from "../routes/workload.ts";
@@ -18,6 +21,12 @@ describe("a busy refusal never starts a retry storm", () => {
     expect(classifyRoutineFailure(busy.message, { modelBusy: true })).toEqual({ kind: "busy" });
     expect(retriesTeammateThread(busy.message, { text: busy.text })).toBe(false);
     expect(retriesTeammateThread(busy.message, { modelBusy: true })).toBe(false);
+  });
+
+  it("is neither a transient error, a usage limit nor a sign-out, so no driver retry, continuation or engine switch follows", () => {
+    expect(classifyError({ text: busy.message })).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyContinuable("error", busy.message)).toBeNull();
+    expect(signedOutStop("error", busy.message)).toBe(false);
   });
 
   it("is recorded on the thread's stop so the harness can leave the Chief out of it", () => {

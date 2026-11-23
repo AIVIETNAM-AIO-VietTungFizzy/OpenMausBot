@@ -12,13 +12,16 @@ It is off by default and changes nothing until it is turned on.
 
 ## What it guarantees
 
-For each Ollama origin (scheme, host and port of the engine's URL):
+For each Ollama server (scheme, host and port of the engine's URL; every name
+for this machine, such as `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`, its
+host name or one of its interface addresses, counts as one server):
 
 | Rule | Default |
 |---|---|
 | Requests sent to Ollama at once | 1 |
 | Interactive requests waiting behind it | 2 |
-| Waiting places one bot may hold | 1 |
+| Waiting places one bot may hold, later rounds included | 1 |
+| Later rounds of other turns that may pass a waiting new turn | 2 |
 | Longest an interactive request waits | 180 s, then a busy notice |
 | Background requests waiting in memory | 8 |
 | Background request goes ahead of waiting people after | 120 s, at most every other dispatch |
@@ -53,10 +56,20 @@ or from anything in a request body.
 
 A turn makes one model request per round. Its first request is a new request.
 Every later round (after tools ran) is a **continuation**: it goes ahead of new
-requests in the interactive queue. A continuation is refused only when both
-waiting places already hold other continuations. If the queue is full of new
-requests when a continuation arrives, the newest waiting new request is refused
-instead (it has not run anything yet, so nothing is left half-done).
+requests in its own lane, interactive or background. A continuation is refused
+only when every waiting place in its lane already holds another continuation.
+If the lane is full when a continuation arrives, the newest waiting new request
+is refused instead (`displaced`; it has not run anything yet, so nothing is left
+half-done).
+
+Continuations cannot starve a waiting new turn: once two later rounds of other
+turns have gone ahead of it, it goes next (`overdueNewTurnGrants` counts these).
+A bot's waiting later round counts toward its one waiting place, so one bot
+cannot hold both interactive places. Two turns of the same bot that are both
+mid-way can each have a later round waiting; refusing either would cut off work
+whose tools already ran.
+
+Background aging is measured from the oldest request in the background lane.
 
 ## The busy notice
 
@@ -75,6 +88,7 @@ notice reaches the person through the chat, not as an HTTP 503 response.
 A busy refusal is never retried automatically:
 
 - **Teammate threads:** they are not retried, and no Chief incident is filed.
+- **Model choice:** a busy refusal is not a usage limit, so it never switches a bot to a backup engine or model.
 - **Routine runs:** they treat it as "busy". The existing routine behaviour then re-checks every 30 s for up to an hour, as it does for a busy bot.
 
 The classification uses the notice key, not the message's words.
@@ -112,9 +126,22 @@ The ledger also bounds and repairs itself:
 Cancelling a job (`POST /api/workload/jobs/<id>/cancel`) cancels its routine run.
 The ledger then settles through the routine's own lifecycle.
 
-Background turns that are not routine runs (hand-offs, incident reports,
-meetings, memory upkeep) keep their existing persistence and failure handling.
-The scheduler only queues their model requests in the bounded background lane.
+Background turns that are not routine runs keep their existing persistence and
+failure handling. The scheduler only queues their model requests in the bounded
+background lane:
+
+| Work | Survives a restart | When its first request is refused (`background-full`) |
+|---|---|---|
+| Routine runs | Yes: `routines.json` plus the ledger | Treated as busy: re-checked every 30 s for up to an hour; a run still refused after that fails like any run that stayed busy that long (its owner is notified and a `routine-failed` incident is filed) |
+| Hand-offs between bots, unattended room turns, meetings, incident reports | Only what the existing turn and room recovery already keeps | The turn ends with the busy notice in its thread; nothing retries it and no Chief incident is filed |
+| Memory upkeep, skill review, representative, status replies, thread titles | No | That one helper call fails as it would on any other model error, with that job's existing error handling |
+
+A later round is not refused while the lane has a new request it can displace,
+so a background turn is cut off mid-way only when every background place
+already holds another turn's later round. If that happens to a routine run, the
+run is re-checked as busy and later starts again from the beginning. Making the
+non-routine background turns durable needs its own job record per kind of work
+and is not part of this feature.
 
 ## Settings
 
@@ -149,7 +176,8 @@ changes.
   - requests by class, by source and by bot;
   - unclassified requests;
   - observed model switches;
-  - aged background grants.
+  - aged background grants;
+  - waiting new turns served after later rounds passed them twice (`overdueNewTurnGrants`).
 - **Timings** (count, mean, p50, p90 and max over the last 200 requests):
   - interactive queue wait;
   - background queue wait;
@@ -158,6 +186,7 @@ changes.
   - total time.
 - **Retry hint:** the current retry-after estimate.
 - **Background jobs:** counts by status, the age of the oldest queued job, and how many were refused because the ledger was full.
+- **Ungoverned senders** (`ungoverned`): bots and project tasks whose CLI engine uses an injected Ollama model, with the Ollama server it sends to and whether a scheduler admits other requests to that same server (`sharesGovernedOrigin`).
 
 `GET /api/workload/jobs?status=queued&limit=50` lists ledger rows,
 `GET /api/workload/jobs/<id>` reads one, and `POST /api/workload/jobs/<id>/cancel`
@@ -197,7 +226,7 @@ docker compose logs omb | grep '\[omb-scheduler\]' | grep -c request_rejected
   app) sending to the same Ollama.
 - Engine CLIs (Claude Code, Codex, ACP agents) pointed at Ollama through a local
   model choice (`ollama::<model>`). They run as their own processes and call
-  Ollama directly.
+  Ollama directly. `GET /api/workload` lists them under `ungoverned`.
 - The CLI's API-key setup "test reply" (`server/cli-api-setup.ts`), a one-off
   check of at most 30 seconds while someone sets up a key.
 - Ollama's non-inference routes (`/api/version`, `/api/tags`, `/api/ps`,
@@ -207,6 +236,30 @@ docker compose logs omb | grep '\[omb-scheduler\]' | grep -c request_rejected
 
 Model selection and the context-window naming (`-omb-<n>k`) are unchanged. The
 scheduler observes model switches and never chooses a model.
+
+### Policy for requests it cannot admit
+
+None of these is blocked: blocking would change which model a bot uses, and
+model routing stays manual. Instead:
+
+1. Before turning the scheduler on, `GET /api/workload` must show an empty
+   `ungoverned` list, or each entry must be accepted by the owner. To bring a
+   bot under the scheduler, move it to the OpenAI-compatible engine that points
+   at the same Ollama.
+2. Exactly one OpenMausBot server sends to a shared Ollama. A second install
+   (another container, data directory or the desktop app) must use a different
+   Ollama or none.
+3. Ollama itself stays at one reply at a time (`OLLAMA_NUM_PARALLEL=1`), so a
+   request from outside the scheduler waits in Ollama's queue rather than
+   running beside an admitted one. While it waits, the admitted request's reply
+   timer runs: a long outside request can make an admitted one time out.
+4. Engine setup checks from the terminal (`openmausbot setup`) are one-off
+   requests of at most 30 seconds; run them outside busy hours.
+
+Inside a container, `127.0.0.1` is the container itself. An engine that reaches
+the host's Ollama through `host.docker.internal` and a CLI engine's injected
+model at `127.0.0.1:11434` are different servers to the scheduler, whatever any
+port forwarding joins.
 
 ## Turning it on and off
 
