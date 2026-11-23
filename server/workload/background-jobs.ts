@@ -4,7 +4,6 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { newId } from "../contracts.ts";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
-const LIVE: readonly JobStatus[] = ["queued", "running"];
 
 /** One background job. Never holds a prompt or a reply: `resultRef` points at where the result lives (a thread). */
 export interface BackgroundJob {
@@ -185,12 +184,16 @@ export class BackgroundJobs {
   /** Live jobs whose owner no longer knows them are cancelled, so they neither count against capacity nor linger. */
   reconcile(stillLive: (job: BackgroundJob) => boolean): number {
     let closed = 0;
-    for (const job of this.list({ limit: 500 }).filter((entry) => LIVE.includes(entry.status))) {
+    for (const job of this.live()) {
       if (stillLive(job)) continue;
       this.settle(job.dedupeKey, "cancelled", { errorClass: "orphaned" });
       closed += 1;
     }
     return closed;
+  }
+
+  private live(): BackgroundJob[] {
+    return (this.db.prepare("SELECT * FROM background_jobs WHERE status IN ('queued','running') ORDER BY queued_at").all() as unknown as Row[]).map(fromRow);
   }
 
   private liveCount(): number {

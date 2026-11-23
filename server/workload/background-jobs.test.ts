@@ -100,6 +100,21 @@ describe("background job ledger", () => {
     expect(jobs.byKey("routine-run:gone")).toMatchObject({ status: "cancelled", errorClass: "orphaned" });
     expect(jobs.byKey("routine-run:kept")).toMatchObject({ status: "queued" });
   });
+
+  it("closes an orphaned live job however many newer settled jobs the ledger keeps", () => {
+    let clock = 0;
+    const jobs = open(":memory:", { capacity: 2, now: () => clock });
+    jobs.request({ ...request, dedupeKey: "routine-run:orphan" });
+    for (let index = 0; index < 600; index++) {
+      clock += 1;
+      const dedupeKey = `routine-run:done-${index}`;
+      jobs.request({ ...request, dedupeKey });
+      jobs.settle(dedupeKey, "completed");
+    }
+    expect(jobs.reconcile(() => false)).toBe(1);
+    expect(jobs.byKey("routine-run:orphan")).toMatchObject({ status: "cancelled", errorClass: "orphaned" });
+    expect("refused" in jobs.request({ ...request, dedupeKey: "routine-run:next" })).toBe(false);
+  });
 });
 
 const run = (id: string, status: RoutineRun["status"] = "queued", extra: Partial<RoutineRun> = {}) =>
