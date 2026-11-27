@@ -12,9 +12,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ownCloud } from "./cloud-list.mjs";
 import { automaticGrant, createComputerSharing, lendsAsWanted } from "./computer-sharing.mjs";
 import { activityPage, createActivityWindow } from "./lending-activity-window.mjs";
-import { createLendingIndicator, indicatorText } from "./lending-indicator.mjs";
+import { actingBot, createLendingIndicator, indicatorText } from "./lending-indicator.mjs";
 import { createLendingTarget } from "./lending-target.mjs";
 import { WORDS } from "./lending-words.mjs";
+import nativeText from "./native-text.cjs";
 
 const HOME = "https://omb-u-fixture.fly.dev", OTHER = "https://omb-c-client-a.fly.dev", TEAM = "https://omb-t-acme.fly.dev";
 const myCloud = { id: "my-cloud", name: "My Cloud", origin: HOME, home: true };
@@ -37,7 +38,7 @@ async function scratch(t) {
 function cloudHome({ link = true, chrome = true } = {}) {
   const json = (value, status = 200) => ({ ok: status < 400, status, headers: { get: () => null }, body: (async function* () { yield Buffer.from(JSON.stringify(value)); })() });
   const state = { environmentId: randomUUID(), sessionId: randomUUID(), connects: [], results: [], queue: [], disconnects: [], calls: 0 };
-  state.push = operation => state.queue.push({ id: randomUUID(), operation: { computer_id: state.connects.at(-1).id, ...operation } });
+  state.push = (operation, by) => state.queue.push({ id: randomUUID(), operation: { computer_id: state.connects.at(-1).id, ...operation }, ...(by ? { by } : {}) });
   state.fetch = async (url, init) => {
     state.calls++;
     const route = new URL(url).pathname;
@@ -158,6 +159,7 @@ test("each Cloud of the person's own is lent this computer by itself: the intern
   const kept = JSON.parse(await readFile(mac.file, "utf8")).records[myCloud.id];
   assert.deepEqual({ home: kept.folders[0].home, path: kept.folders[0].path, write: kept.folders[0].write }, { home: true, path: home, write: true });
   assert.deepEqual(mac.summaries.at(-1).clouds, ["My Cloud"]);
+  await until(() => mac.summaries.at(-1).typing === true, "the menu bar to say bots use this computer while the person types on it");
 });
 
 test("a server of the person's own their bots moved to is lent as their Clouds are, only while it is home, says it is theirs alone and is the server the move chose", async t => {
@@ -178,6 +180,8 @@ test("a server of the person's own their bots moved to is lent as their Clouds a
   await until(() => server.connects.length === 1, "Garage server to be lent this computer, with no click");
   assert.equal(server.connects[0].terminal, false);
   assert.deepEqual(mac.summaries.at(-1).clouds, ["Garage server"], "the menu bar says who can use this computer");
+  await until(() => mac.summaries.at(-1).waiting.length === 0, "Garage server to accept this computer");
+  assert.equal(mac.summaries.at(-1).typing, undefined, "a server of the person's own never matches the computer typed on");
   mac.sharing.pause();
   assert.equal(mac.summaries.at(-1).paused, true);
   await mac.sharing.resume();
@@ -379,6 +383,11 @@ test("the terminal is lent only once the person turns it on: every own Cloud get
   await restarted.lendTerminal(false);
   await until(() => homes[HOME].connects.length === 4, "the grant without the terminal to reach My Cloud");
   assert.equal(homes[HOME].connects[3].terminal, false);
+  // Turned off, it stays off across the next restart too (the together switch grants it only when turned on).
+  const again = mac.restart();
+  again.start();
+  await until(() => homes[HOME].connects.length === 5, "the kept grant after a second restart");
+  assert.equal(homes[HOME].connects[4].terminal, false, "still off after a restart");
 });
 
 test("a terminal choice that can't be saved is not kept, so nothing lends it later", async t => {
@@ -507,6 +516,66 @@ test("the move's project folders are lent to My Cloud with editing on top; while
   await assert.rejects(mac.sharing.lendProjects([app]), /waits/);
 });
 
+test("the menu-bar item names the bot acting on this Mac, with its colour, and keeps naming it between its steps", async t => {
+  const homes = { [HOME]: cloudHome() };
+  const mac = await computer(t, { homes, places: [myCloud] });
+  mac.sharing.start();
+  await until(() => homes[HOME].connects.length === 1, "My Cloud to be lent this computer");
+  homes[HOME].push({ action: "computer_tools" }, { name: "  IT   Support ", color: "teal", secret: "never kept" });
+  await until(() => homes[HOME].results.length === 1, "the bot's action to run");
+  assert.deepEqual(mac.summaries.at(-1).bots, [{ name: "IT Support", color: "teal", cloud: "My Cloud" }]);
+  assert.deepEqual(mac.summaries.at(-1).using, ["My Cloud"], "the action is over, but the bot is still named until its next step");
+  assert.equal(indicatorText(mac.summaries.at(-1), "Mac").title, "IT Support is using this Mac");
+  // A step that names no bot (an older Cloud) keeps the name; a second bot is named beside the first.
+  homes[HOME].push({ action: "computer_tools" });
+  await until(() => homes[HOME].results.length === 2, "the unnamed action to run");
+  homes[HOME].push({ action: "computer_tools" }, { name: "Writer", color: "pink" });
+  await until(() => homes[HOME].results.length === 3, "the second bot's action to run");
+  assert.deepEqual(mac.summaries.at(-1).bots.map(bot => bot.name), ["IT Support", "Writer"]);
+  assert.equal(indicatorText(mac.summaries.at(-1), "Mac").title, "IT Support and Writer are using this Mac");
+  // Pausing ends it at once.
+  mac.sharing.pause();
+  await until(() => mac.summaries.at(-1).paused === true, "the pause");
+  assert.equal(mac.summaries.at(-1).bots, undefined);
+});
+
+test("a bot's name from a Cloud is shown only as short plain text, and its colour only as a colour word", () => {
+  assert.deepEqual(actingBot({ name: " Word\n assistant ", color: "purple" }), { name: "Word assistant", color: "purple" });
+  assert.deepEqual(actingBot({ name: "Support", color: "#fff; rm" }), { name: "Support", color: null });
+  assert.equal(actingBot({ name: "x".repeat(80) })?.name, "x".repeat(80), "every name the server allows (80) is shown");
+  for (const by of [null, {}, { name: "" }, { name: 7 }, { name: "x".repeat(81) }, { name: "Bell\u0007" }, { name: "Support\u202Eevil" }, { name: "Zero\u200Bwidth" }]) assert.equal(actingBot(by), null, JSON.stringify(by));
+});
+
+test("three or more names in the menu-bar title count bots as bots and Clouds as Clouds", () => {
+  const bots = names => names.map(name => ({ name, color: null, cloud: "My Cloud" }));
+  assert.equal(indicatorText({ clouds: ["My Cloud"], using: ["My Cloud"], bots: bots(["A", "B", "C"]) }, "Mac").title, "3 bots are using this Mac");
+  assert.equal(indicatorText({ clouds: ["My Cloud", "Client A"], using: ["My Cloud", "Client A"], bots: bots(["A", "B"]) }, "Mac").title, "2 Clouds are using this Mac");
+  assert.equal(indicatorText({ clouds: ["X", "Y", "Z"], using: ["X", "Y", "Z"] }, "Mac").title, "3 Clouds are using this Mac");
+});
+
+test("the menu names each bot using this Mac with its colour dot; See activity is one click from it", () => {
+  const trays = [];
+  class Tray { constructor() { trays.push(this); } on() {} setToolTip(value) { this.tip = value; } setTitle(value) { this.title = value; } setContextMenu(menu) { this.menu = menu; } isDestroyed() { return false; } destroy() {} }
+  const image = () => { const reps = []; return { reps, addRepresentation: rep => reps.push(rep), isEmpty: () => reps.length === 0 }; };
+  const clicked = [];
+  const indicator = createLendingIndicator({ Tray, Menu: { buildFromTemplate: items => items }, nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: image }, iconPath: "icon.png",
+    onPause: () => {}, onResume: () => {}, onActivity: () => clicked.push("activity"), onTerminal: () => {}, device: "Mac" });
+  const labels = () => trays[0].menu.map(item => item.type === "separator" ? "-" : item.label);
+  indicator.update({ clouds: ["My Cloud", "Client A"], using: ["My Cloud", "Client A"], bots: [{ name: "IT Support", color: "teal", cloud: "My Cloud" }] });
+  assert.deepEqual(labels(), ["IT Support on My Cloud is using this Mac", "Client A is using this Mac", "-", "Pause", "Let Clouds run commands on this Mac", "See activity"]);
+  const [bot, cloud] = trays[0].menu;
+  assert.deepEqual(bot.icon.reps.map(rep => [rep.scaleFactor, rep.dataURL.startsWith("data:image/png;base64,")]), [[1, true], [2, true]]);
+  assert.equal(cloud.enabled, false);
+  bot.click();
+  assert.deepEqual(clicked, ["activity"]);
+  assert.equal(trays[0].title, "IT Support and Client A are using this Mac");
+  assert.equal(trays[0].tip, "OpenMausBot: IT Support on My Cloud is using this Mac. Client A is using this Mac");
+  indicator.update({ clouds: ["My Cloud"], using: ["My Cloud"], bots: [{ name: "Helper", color: null, cloud: "My Cloud" }] });
+  assert.deepEqual([labels()[0], trays[0].menu[0].icon], ["Helper on My Cloud is using this Mac", undefined], "no dot for a colour this app doesn't know");
+  indicator.update({ clouds: ["My Cloud"], using: ["My Cloud"], bots: [{ name: "Helper", color: "red", cloud: "My Cloud" }], paused: true });
+  assert.equal(labels()[0], "Paused: My Cloud can't use this Mac");
+});
+
 test("the menu-bar item: which Clouds are using this Mac, Pause or Resume, the terminal switch and See activity", () => {
   const trays = [];
   class Tray {
@@ -551,6 +620,25 @@ test("the menu-bar item: which Clouds are using this Mac, Pause or Resume, the t
   assert.equal(trays[0].destroyed, true, "gone once there is no Cloud to resume");
   assert.deepEqual(indicatorText({ clouds: ["A", "B", "C"], using: ["A", "B", "C"], paused: false }, "PC"),
     { line: "A, B and C are using this PC", title: "3 Clouds are using this PC", screen: null });
+});
+
+test("the PC's tray item ends with Quit, paused or not, when the app gives it one", () => {
+  const trays = [];
+  class Tray {
+    constructor() { trays.push(this); }
+    on() {} setToolTip() {} setContextMenu(menu) { this.menu = menu; } isDestroyed() { return false; } destroy() {}
+  }
+  let quits = 0;
+  const indicator = createLendingIndicator({ Tray, Menu: { buildFromTemplate: items => items }, nativeImage: { createFromPath: () => ({ resize: () => ({}) }) }, iconPath: "icon.png",
+    onPause() {}, onResume() {}, onActivity() {}, onTerminal() {}, onQuit: () => quits++, device: "PC" });
+  const labels = () => trays[0].menu.map(item => item.type === "separator" ? "-" : item.label);
+  const quit = nativeText.englishText.t("native.tray.quit");
+  indicator.update({ clouds: ["My Cloud"], using: [], paused: true });
+  assert.deepEqual(labels(), ["Paused: My Cloud can't use this PC", "-", "Resume", "See activity", "-", quit]);
+  indicator.update({ clouds: ["My Cloud"], using: [], paused: false });
+  assert.deepEqual(labels().slice(-2), ["-", quit]);
+  trays[0].menu.at(-1).click();
+  assert.equal(quits, 1);
 });
 
 test("See activity shows this computer's own record in the app's language: every value escaped, no script, nothing loaded", async () => {

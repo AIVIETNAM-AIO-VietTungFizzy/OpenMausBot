@@ -1,6 +1,6 @@
 // The Vault: saved logins and saved secrets. Sealed under a key of its own (a 0600 file beside it), never the browser
-// engine's, which every browser process gets in its environment. Neither file is ever backed up, exported or moved: a
-// saved value stays on its computer, unless the person sends that one login to their own Cloud with Also use on My Cloud
+// engine's, which every browser process gets in its environment. None of its files is ever backed up, exported or moved: a
+// saved value stays on its computer, unless the person sends it to their own Cloud with Also use on My Cloud
 // (login-handoff.ts).
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -8,14 +8,18 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { HELD_SECRET_MASK } from "../shared/redact.ts";
-import { LOGIN_FIELD_MAX, LOGIN_HOSTS_MAX, loginMatchesHost, loginSite, loginUsableBy, type LoginBots, type LoginPlace, type LoginSummary } from "../shared/logins.ts";
-import { SECRET_VALUE_MAX_BYTES, VAULT_SECRET_NAME_MAX, vaultNameKey, type VaultSecret } from "../shared/vault.ts";
+import { LOGIN_FIELD_MAX, LOGIN_HOSTS_MAX, loginMatchesHost, loginPlace, loginSite, loginUsableBy, type BitwardenCredentials, type BitwardenSecretsCredentials, type LoginBots, type LoginPlace, type LoginSummary } from "../shared/logins.ts";
+import { VAULT_SECRET_NAME_MAX, vaultNameKey, type VaultSecret } from "../shared/vault.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { decryptBrowserState, encryptBrowserState } from "./browser-sites.ts";
 import type { TotpKey } from "./totp.ts";
+import { STORED_VAULT_VALUE_MAX_BYTES, VAULT_VALUE_MAX_BYTES } from "./vault/value-limits.ts";
 
 export const LOGINS_FILE = "logins.json.enc";
 export const LOGINS_KEY_FILE = "logins-key";
+/** A Team Cloud member's own secrets, sealed under the same key. A file of their own, so the previous release, which
+ * would read them as the team's, never opens it. */
+export const MEMBER_SECRETS_FILE = "member-secrets.json.enc";
 
 const totpSchema = z.object({
   secret: z.string().regex(/^[A-Z2-7]{16,}$/u),
@@ -25,6 +29,12 @@ const totpSchema = z.object({
 });
 
 const botsSchema = z.union([z.literal("all"), z.array(z.string())]);
+
+function checkNewSecretValue(value: string): void {
+  if (Buffer.byteLength(value) > VAULT_VALUE_MAX_BYTES) {
+    throw new RangeError(`A new Vault secret value can be at most ${VAULT_VALUE_MAX_BYTES} bytes.`);
+  }
+}
 
 // The previous release reads `version: 1` records by `host` alone and replaces a file it cannot parse, so every record
 // keeps `host` (its first sign-in host) and the version stays 1: going back a release never loses a saved login.
@@ -47,7 +57,7 @@ const diskLoginSchema = z.object({
 const diskSecretSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1).max(VAULT_SECRET_NAME_MAX),
-  value: z.string().min(1).max(SECRET_VALUE_MAX_BYTES),
+  value: z.string().min(1).refine((value) => Buffer.byteLength(value) <= STORED_VAULT_VALUE_MAX_BYTES),
   source: z.enum(["card", "settings"]),
   bots: botsSchema,
   refOnly: z.literal(true).optional(),
@@ -62,8 +72,25 @@ const fileSchema = z.object({
   logins: z.array(diskLoginSchema),
   secrets: z.array(diskSecretSchema).optional(),
   onePassword: z.object({ token: z.string().min(1), connectedAt: z.number() }).optional(),
+  /** Bitwarden's server address, API key and master password, read only by its command line tool's environment. */
+  bitwarden: z.object({ serverUrl: z.string().min(1), clientId: z.string().min(1), clientSecret: z.string().min(1), password: z.string().min(1), connectedAt: z.number() }).optional(),
+  /** Bitwarden Secrets Manager's server address and a machine account's access token. */
+  bitwardenSecrets: z.object({ serverUrl: z.string().min(1), accessToken: z.string().min(1), connectedAt: z.number() }).optional(),
   /** Vault id → the bots that may use its logins; a vault not named here is for every bot. Kept across reconnects. */
   onePasswordGrants: z.record(z.string(), botsSchema).optional(),
+  /** 1Password item (`<vault id>:<item id>`) → the bots that may use it, ahead of its vault's choice. Kept across reconnects. */
+  onePasswordItemGrants: z.record(z.string(), botsSchema).optional(),
+  /** Security: MCP server name → the items whose `vault:<id>` that server may read. Written only when a bot's secretRef
+   * is redeemed into the server (or a move carries the server), so a pointer planted in config.json reads nothing. */
+  mcpKeys: z.record(z.string(), z.array(z.string().min(1))).optional(),
+  /** A pasted GitHub token per sign-in (`owner`, or a Team Cloud member's person key): server-side git and GitHub calls
+   * only (server/github/sign-in.ts), never a bot's, never listed with the saved secrets. */
+  github: z.record(z.string(), z.object({ token: z.string().min(1), login: z.string(), savedAt: z.number() })).optional(),
+});
+
+const memberSecretsSchema = z.object({
+  version: z.literal(1),
+  secrets: z.array(diskSecretSchema.extend({ person: z.string().regex(/^p_[\w-]{22}$/u) })),
 });
 
 type DiskLogin = z.infer<typeof diskLoginSchema>;
@@ -71,9 +98,24 @@ type DiskFile = z.infer<typeof fileSchema>;
 
 /** One saved login with its secrets. Server-only: no route returns this. */
 export type StoredLogin = Omit<DiskLogin, "host" | "site" | "hosts" | "exactHost"> & LoginPlace;
-type StoreFile = Omit<DiskFile, "logins"> & { logins: StoredLogin[] };
-/** One saved secret with its value. Server-only: no route returns this. */
-export type StoredSecret = z.infer<typeof diskSecretSchema>;
+type StoreFile = Omit<DiskFile, "logins" | "secrets"> & { logins: StoredLogin[]; secrets?: StoredSecret[] };
+/** One saved secret with its value. Server-only: no route returns this. `person`: a Team Cloud member's own, typed
+ * into a card in their private chat; absent: the team's (every secret off a Team Cloud). */
+export type StoredSecret = z.infer<typeof diskSecretSchema> & { person?: string };
+
+/** Who reads the Vault: `person`'s own secrets, and the team's when `team`. */
+export interface VaultReader {
+  person: string | null;
+  team: boolean;
+}
+
+/** A turn off a Team Cloud, or in a conversation that is no one person's own, and an admin's view with no person. */
+export const TEAM_READER: VaultReader = { person: null, team: true };
+
+/** Security: a member's own secret reaches only their own turns and their own Settings, never an admin's. */
+export function secretReadable(secret: { person?: string }, reader: VaultReader): boolean {
+  return secret.person ? secret.person === reader.person : reader.team;
+}
 
 export interface NewSecret {
   name: string;
@@ -81,6 +123,7 @@ export interface NewSecret {
   source: "card" | "settings";
   bots: LoginBots;
   refOnly?: boolean;
+  person?: string;
 }
 
 export interface SecretPatch {
@@ -98,6 +141,8 @@ export interface NewLogin extends LoginPlace {
 }
 
 export interface LoginPatch {
+  /** A new host for the login: its site becomes that host's, and its sign-in hosts just that host. */
+  site?: string;
   username?: string;
   password?: string;
   totp?: TotpKey | null;
@@ -124,7 +169,7 @@ export function summarizeLogin(login: StoredLogin): LoginSummary {
   };
 }
 
-export function summarizeSecret({ value: _value, ...secret }: StoredSecret): VaultSecret {
+export function summarizeSecret({ value: _value, person: _person, ...secret }: StoredSecret): VaultSecret {
   return secret;
 }
 
@@ -141,16 +186,21 @@ function sameAccount(login: StoredLogin, input: NewLogin): boolean {
 
 export class VaultStore {
   private readonly file: string;
+  private readonly memberFile: string;
   private readonly keyFile: string;
   private readonly now: () => number;
+  private readonly secretChanged: (id: string) => void;
   private cache: StoreFile | null = null;
   private unreadableWarned = false;
   version = 0;
 
-  constructor(options: { dataDir: string; now?: () => number }) {
+  /** `secretChanged`: a saved secret's value or who may use it changed, or it is gone. */
+  constructor(options: { dataDir: string; now?: () => number; secretChanged?: (id: string) => void }) {
     this.file = join(options.dataDir, LOGINS_FILE);
+    this.memberFile = join(options.dataDir, MEMBER_SECRETS_FILE);
     this.keyFile = join(options.dataDir, LOGINS_KEY_FILE);
     this.now = options.now ?? Date.now;
+    this.secretChanged = options.secretChanged ?? (() => {});
   }
 
   private key(create: boolean): string | null {
@@ -182,17 +232,36 @@ export class VaultStore {
         data = EMPTY;
       }
     }
+    const members = this.readMembers();
+    if (members.length) data = { ...data, secrets: [...data.secrets ?? [], ...members] };
     this.cache = data;
     this.version++;
     return data;
   }
 
+  private readMembers(): StoredSecret[] {
+    if (!existsSync(this.memberFile)) return [];
+    try {
+      const key = this.key(false);
+      if (!key) throw new Error("missing key");
+      return memberSecretsSchema.parse(JSON.parse(decryptBrowserState(readFileSync(this.memberFile), key))).secrets;
+    } catch {
+      if (!this.unreadableWarned) console.warn("saved logins: the members' secrets file could not be opened; it will be replaced on the next save");
+      this.unreadableWarned = true;
+      return [];
+    }
+  }
+
   private write(data: StoreFile): void {
-    const parsed = fileSchema.parse({ ...data, logins: data.logins.map(toDisk) });
+    const members = (data.secrets ?? []).filter((secret) => secret.person);
+    const team = data.secrets?.filter((secret) => !secret.person);
+    const parsed = fileSchema.parse({ ...data, logins: data.logins.map(toDisk), ...(team ? { secrets: team } : {}) });
+    const ownParsed = memberSecretsSchema.parse({ version: 1, secrets: members });
     const key = this.key(true)!;
     mkdirSync(join(this.file, ".."), { recursive: true });
     writeFileAtomic(this.file, encryptBrowserState(JSON.stringify(parsed), key), { mode: 0o600 });
-    this.cache = { ...parsed, logins: parsed.logins.map(fromDisk) };
+    if (members.length || existsSync(this.memberFile)) writeFileAtomic(this.memberFile, encryptBrowserState(JSON.stringify(ownParsed), key), { mode: 0o600 });
+    this.cache = { ...parsed, logins: parsed.logins.map(fromDisk), ...(ownParsed.secrets.length ? { secrets: [...parsed.secrets ?? [], ...ownParsed.secrets] } : {}) };
     this.version++;
   }
 
@@ -237,12 +306,15 @@ export class VaultStore {
     return summarizeLogin(login);
   }
 
-  update(id: string, patch: LoginPatch): LoginSummary | null {
+  /** "taken" when the login would move onto a site where the same account is already saved. */
+  update(id: string, patch: LoginPatch): LoginSummary | null | "taken" {
     const data = this.read();
     const current = data.logins.find((login) => login.id === id);
     if (!current) return null;
+    const moved = patch.site !== undefined && !current.hosts.includes(patch.site);
     const next: StoredLogin = {
       ...current,
+      ...(moved ? loginPlace(patch.site!, [], current.exactHost) : {}),
       ...(patch.username === undefined ? {} : { username: patch.username }),
       ...(patch.password === undefined ? {} : { password: patch.password }),
       ...(patch.bots === undefined ? {} : { bots: patch.bots }),
@@ -251,6 +323,7 @@ export class VaultStore {
     };
     if (patch.totp === null) delete next.totp;
     else if (patch.totp) next.totp = patch.totp;
+    if (moved && data.logins.some((login) => login.id !== id && sameAccount(login, next))) return "taken";
     this.write({ ...data, logins: data.logins.map((login) => login.id === id ? next : login) });
     return summarizeLogin(next);
   }
@@ -288,46 +361,71 @@ export class VaultStore {
     return this.read().secrets?.find((secret) => secret.id === id) ?? null;
   }
 
-  listSecrets(): VaultSecret[] {
-    return (this.read().secrets ?? []).map(summarizeSecret).sort((a, b) => a.name.localeCompare(b.name));
+  listSecrets(reader: VaultReader): VaultSecret[] {
+    return (this.read().secrets ?? []).filter((secret) => secretReadable(secret, reader)).map(summarizeSecret).sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  /** The secret `botId` may use by this name, as a ref or a file: one kept to some bots before one for every bot, then
-   * the newest. */
-  usableSecret(name: string, botId: string, delivery: "ref" | "file"): StoredSecret | null {
+  /** The secret `botId` may use by this name, as a ref or a file, in a turn `reader` names: the person's own before the
+   * team's of the same name, whichever was saved later; then one kept to some bots before one for every bot; then the
+   * newest. */
+  usableSecret(name: string, botId: string, delivery: "ref" | "file", reader: VaultReader): StoredSecret | null {
     const key = vaultNameKey(name);
     const matches = (this.read().secrets ?? []).filter((secret) => vaultNameKey(secret.name) === key && loginUsableBy(secret, botId) &&
-      (delivery === "ref" || !secret.refOnly));
-    return matches.sort((a, b) => Number(b.bots !== "all") - Number(a.bots !== "all") || b.updatedAt - a.updatedAt)[0] ?? null;
+      secretReadable(secret, reader) && (delivery === "ref" || !secret.refOnly));
+    return matches.sort((a, b) => Number(Boolean(b.person)) - Number(Boolean(a.person)) || Number(b.bots !== "all") - Number(a.bots !== "all") ||
+      b.updatedAt - a.updatedAt)[0] ?? null;
   }
 
-  secretNamesFor(botId: string): Array<{ name: string; refOnly?: true }> {
-    return (this.read().secrets ?? []).filter((secret) => loginUsableBy(secret, botId)).map(({ name, refOnly }) => ({ name, ...(refOnly ? { refOnly } : {}) }));
+  secretNamesFor(botId: string, reader: VaultReader): Array<{ name: string; refOnly?: true }> {
+    return (this.read().secrets ?? []).filter((secret) => loginUsableBy(secret, botId) && secretReadable(secret, reader))
+      .map(({ name, refOnly }) => ({ name, ...(refOnly ? { refOnly } : {}) }));
   }
 
-  /** The same name saved again for the same bots replaces its value; otherwise it is a new secret. */
+  /** The same name saved again for the same bots and the same person replaces its value; otherwise it is a new secret. */
   saveSecret(input: NewSecret): VaultSecret {
+    checkNewSecretValue(input.value);
     const data = this.read();
     const secrets = data.secrets ?? [];
     const at = this.now();
-    const same = secrets.find((secret) => vaultNameKey(secret.name) === vaultNameKey(input.name) && sameBots(secret.bots, input.bots));
+    const same = secrets.find((secret) => vaultNameKey(secret.name) === vaultNameKey(input.name) && sameBots(secret.bots, input.bots) && secret.person === input.person);
     if (same) {
       const { refOnly: _refOnly, ...rest } = same;
       const updated: StoredSecret = { ...rest, value: input.value, updatedAt: at, ...(input.refOnly ? { refOnly: true } : {}) };
       this.write({ ...data, secrets: secrets.map((secret) => secret.id === same.id ? updated : secret) });
+      this.secretChanged(same.id);
       return summarizeSecret(updated);
     }
     const secret: StoredSecret = {
       id: randomUUID(), name: input.name, value: input.value, source: input.source, bots: input.bots, ...(input.refOnly ? { refOnly: true } : {}), createdAt: at, updatedAt: at,
+      ...(input.person ? { person: input.person } : {}),
     };
     this.write({ ...data, secrets: [...secrets, secret] });
     return summarizeSecret(secret);
+  }
+
+  /** A secret arriving from this person's other computer, under the id it has there: an MCP server's `vault:<id>` moves
+   * with it. Sent again, it replaces the one it came from; never a member's own (null). */
+  receiveSecret(input: Omit<NewSecret, "person"> & { id: string }): VaultSecret | null {
+    const data = this.read();
+    const secrets = data.secrets ?? [];
+    const at = this.now();
+    const current = secrets.find((secret) => secret.id === input.id);
+    if (current?.person) return null;
+    checkNewSecretValue(input.value);
+    const received: StoredSecret = {
+      id: input.id, name: input.name, value: input.value, source: input.source, bots: input.bots, ...(input.refOnly ? { refOnly: true } : {}),
+      createdAt: current?.createdAt ?? at, updatedAt: at, ...(current?.lastUsedAt === undefined ? {} : { lastUsedAt: current.lastUsedAt }),
+    };
+    this.write({ ...data, secrets: current ? secrets.map((secret) => secret.id === input.id ? received : secret) : [...secrets, received] });
+    this.secretChanged(input.id);
+    return summarizeSecret(received);
   }
 
   updateSecret(id: string, patch: SecretPatch): VaultSecret | null {
     const data = this.read();
     const current = data.secrets?.find((secret) => secret.id === id);
     if (!data.secrets || !current) return null;
+    if (patch.value !== undefined) checkNewSecretValue(patch.value);
     const next: StoredSecret = {
       ...current,
       ...(patch.name === undefined ? {} : { name: patch.name }),
@@ -336,6 +434,7 @@ export class VaultStore {
       updatedAt: this.now(),
     };
     this.write({ ...data, secrets: data.secrets.map((secret) => secret.id === id ? next : secret) });
+    this.secretChanged(id);
     return summarizeSecret(next);
   }
 
@@ -343,7 +442,62 @@ export class VaultStore {
     const data = this.read();
     if (!data.secrets?.some((secret) => secret.id === id)) return false;
     this.write({ ...data, secrets: data.secrets.filter((secret) => secret.id !== id) });
+    this.secretChanged(id);
     return true;
+  }
+
+  /** A member who left the team: every secret of their own goes. */
+  forgetPerson(person: string): number {
+    const data = this.read();
+    const gone = (data.secrets ?? []).filter((secret) => secret.person === person).map((secret) => secret.id);
+    if (data.github?.[person]) this.setGithubToken(person, null);
+    if (!gone.length) return 0;
+    this.write({ ...this.read(), secrets: data.secrets!.filter((secret) => secret.person !== person) });
+    for (const id of gone) this.secretChanged(id);
+    return gone.length;
+  }
+
+  /** A deleted bot leaves every secret kept to it; a secret kept only to it goes with it. */
+  forgetBot(botId: string): void {
+    const data = this.read();
+    if (!data.secrets) return;
+    const touched: string[] = [];
+    const at = this.now();
+    const secrets = data.secrets.flatMap((secret) => {
+      if (secret.bots === "all" || !secret.bots.includes(botId)) return [secret];
+      touched.push(secret.id);
+      const bots = secret.bots.filter((id) => id !== botId);
+      return bots.length ? [{ ...secret, bots, updatedAt: at }] : [];
+    });
+    if (!touched.length) return;
+    this.write({ ...data, secrets });
+    for (const id of touched) this.secretChanged(id);
+  }
+
+  /** The items this MCP server may read a `vault:<id>` key from. */
+  mcpServerKeys(server: string): string[] {
+    return this.read().mcpKeys?.[server] ?? [];
+  }
+
+  /** The MCP servers given this item's key. */
+  serversUsingKey(id: string): string[] {
+    return Object.entries(this.read().mcpKeys ?? {}).filter(([, ids]) => ids.includes(id)).map(([server]) => server);
+  }
+
+  /** `server` may read these items' `vault:<id>` keys from now on; what it could read before is kept. */
+  grantMcpKeys(server: string, ids: readonly string[]): void {
+    if (!ids.length) return;
+    const data = this.read();
+    const { [server]: current = [], ...others } = data.mcpKeys ?? {};
+    this.write({ ...data, mcpKeys: { ...others, [server]: [...new Set([...current, ...ids])] } });
+  }
+
+  forgetMcpServer(server: string): void {
+    const data = this.read();
+    if (!data.mcpKeys?.[server]) return;
+    const { [server]: _gone, ...others } = data.mcpKeys;
+    const { mcpKeys: _keys, ...rest } = data;
+    this.write(Object.keys(others).length ? { ...rest, mcpKeys: others } : rest);
   }
 
   onePasswordToken(): string | null {
@@ -354,6 +508,26 @@ export class VaultStore {
     const data = this.read();
     const { onePassword: _previous, ...rest } = data;
     this.write(token ? { ...rest, onePassword: { token, connectedAt: this.now() } } : rest);
+  }
+
+  bitwardenCredentials(): BitwardenCredentials | null {
+    const saved = this.read().bitwarden;
+    return saved ? { serverUrl: saved.serverUrl, clientId: saved.clientId, clientSecret: saved.clientSecret, password: saved.password } : null;
+  }
+
+  setBitwardenCredentials(credentials: BitwardenCredentials | null): void {
+    const { bitwarden: _previous, ...rest } = this.read();
+    this.write(credentials ? { ...rest, bitwarden: { ...credentials, connectedAt: this.now() } } : rest);
+  }
+
+  bitwardenSecretsCredentials(): BitwardenSecretsCredentials | null {
+    const saved = this.read().bitwardenSecrets;
+    return saved ? { serverUrl: saved.serverUrl, accessToken: saved.accessToken } : null;
+  }
+
+  setBitwardenSecretsCredentials(credentials: BitwardenSecretsCredentials | null): void {
+    const { bitwardenSecrets: _previous, ...rest } = this.read();
+    this.write(credentials ? { ...rest, bitwardenSecrets: { ...credentials, connectedAt: this.now() } } : rest);
   }
 
   onePasswordGrants(): Record<string, LoginBots> {
@@ -369,11 +543,43 @@ export class VaultStore {
     this.write(Object.keys(grants).length ? { ...rest, onePasswordGrants: grants } : rest);
   }
 
+  onePasswordItemGrants(): Record<string, LoginBots> {
+    return this.read().onePasswordItemGrants ?? {};
+  }
+
+  /** null hands the item back to its vault's choice. */
+  setOnePasswordItemGrant(key: string, bots: LoginBots | null): void {
+    const { [key]: _previous, ...others } = this.onePasswordItemGrants();
+    this.setOnePasswordItemGrants(bots === null ? others : { ...others, [key]: bots });
+  }
+
+  /** Every item's own bots at once: an item left out goes back to its vault's choice. */
+  setOnePasswordItemGrants(grants: Record<string, LoginBots>): void {
+    const { onePasswordItemGrants: _grants, ...rest } = this.read();
+    this.write(Object.keys(grants).length ? { ...rest, onePasswordItemGrants: grants } : rest);
+  }
+
+  /** The GitHub token pasted for one sign-in (sign-in.ts): never a route's answer, never a bot's. */
+  githubToken(audience: string): { token: string; login: string } | null {
+    const saved = this.read().github?.[audience];
+    return saved ? { token: saved.token, login: saved.login } : null;
+  }
+
+  setGithubToken(audience: string, saved: { token: string; login: string } | null): void {
+    const { github, ...rest } = this.read();
+    const { [audience]: _previous, ...others } = github ?? {};
+    const next = saved ? { ...others, [audience]: { ...saved, savedAt: this.now() } } : others;
+    this.write(Object.keys(next).length ? { ...rest, github: next } : rest);
+  }
+
   secretValues(): string[] {
     const data = this.read();
     return [
+      ...Object.values(data.github ?? {}).map((saved) => saved.token),
       ...data.logins.flatMap((login) => [login.password, ...(login.totp ? [login.totp.secret] : [])]),
       ...(data.onePassword ? [data.onePassword.token] : []),
+      ...(data.bitwarden ? [data.bitwarden.clientSecret, data.bitwarden.password] : []),
+      ...(data.bitwardenSecrets ? [data.bitwardenSecrets.accessToken] : []),
       ...(data.secrets ?? []).map((secret) => secret.value),
     ];
   }

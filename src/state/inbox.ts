@@ -94,7 +94,7 @@ const patchRow = (id: string, patch: Partial<InboxRow>) => {
 };
 
 /** Tells the server; if it can't be told, the row goes back to how it was (`undo`) and the list is read again. */
-async function mark(id: string, what: "read" | "done", undo: Partial<InboxRow>): Promise<void> {
+async function mark(id: string, what: "read" | "unread" | "done", undo: Partial<InboxRow>): Promise<void> {
   const seq = ++sent;
   const view = await api<InboxView>(`/api/inbox/${id}/${what}`, { method: "POST", background: true }).catch(() => null);
   if (view && Array.isArray(view.rows)) return show(seq, view);
@@ -109,6 +109,29 @@ export function readInboxRow(row: Pick<InboxRow, "id" | "unread">): void {
   void mark(row.id, "read", { unread: true });
 }
 
+/** The person wants a line they read to stay new: it is bold again, and counted again where it counts. */
+export function unreadInboxRow(row: Pick<InboxRow, "id">): void {
+  patchRow(row.id, { unread: true });
+  void mark(row.id, "unread", { unread: false });
+}
+
+const marking = store(false);
+export const useInboxMarkingAll = (): boolean => useSyncExternalStore(marking.subscribe, marking.get, marking.get);
+
+/** The person read every line: none is bold, and no ask is answered or moves tab. */
+export function markAllInboxRead(): void {
+  if (marking.get()) return;
+  const view = list.get();
+  if (view) { shown = ++sent; list.set({ ...view, rows: view.rows.map((row) => (row.unread ? { ...row, unread: false } : row)) }); }
+  const seq = ++sent;
+  marking.set(true);
+  void api<InboxView>("/api/inbox/read-all", { method: "POST", background: true }).catch(() => null).then((next) => {
+    marking.set(false);
+    if (next && Array.isArray(next.rows)) return show(seq, next);
+    void refreshInbox();
+  });
+}
+
 /** An ask the person just answered here: it leaves the list at once, before the server's next read says so. */
 export const settleInboxRow = (row: Pick<InboxRow, "id">): void => patchRow(row.id, { tab: "done", unread: false });
 
@@ -120,10 +143,11 @@ export function doneInboxRow(row: Pick<InboxRow, "id">): void {
 }
 
 /** A reply to a line of news that waits on one: it goes back where the line came from, as a Reply in the chat does. */
-export async function replyToInboxRow(view: Pick<InboxView, "botId" | "threadId">, row: Pick<InboxRow, "id" | "origin">, text: string): Promise<void> {
+export async function replyToInboxRow(view: Pick<InboxView, "botId" | "threadId">, row: Pick<InboxRow, "id" | "origin" | "unread">, text: string): Promise<void> {
   const origin = view.threadId ? null : row.origin;
   const path = origin?.groupId ? `/api/groups/${origin.groupId}/messages` : `/api/bots/${origin?.botId ?? view.botId}/messages`;
   await api(path, { method: "POST", body: JSON.stringify({ text, threadId: origin?.threadId ?? view.threadId, replyToId: row.id, sendId: randomUuid() }) });
+  readInboxRow(row);
   void refreshInbox();
 }
 

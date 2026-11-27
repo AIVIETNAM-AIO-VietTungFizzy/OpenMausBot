@@ -8,6 +8,7 @@ import { APP_LIMITS, APP_MIME, type AppPayload } from "../shared/app.ts";
 import { createChatApps, type ChatApps } from "./chat-apps.ts";
 import { APP_WRITE_DECLINED, createChatAppsMcp, type ChatAppsMcp, type ChatAppsMcpOAuth, type ChatAppsMcpStore } from "./chat-apps-mcp.ts";
 import { createAgentCard } from "./chat-widgets.ts";
+import { createConnectorGate, type ConnectorCaller } from "./connector-gate.ts";
 import type { McpServerSpec } from "./contracts.ts";
 import { McpOAuthManager, withMcpSignIn } from "./mcp-oauth.ts";
 import { probeMcpServer, SIGN_IN_CHECK_TOOL } from "./mcp-probe.ts";
@@ -35,7 +36,7 @@ const REPORT = {
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const step of cleanup.splice(0).reverse()) await step(); });
 
-function setup(options: { servers?: Record<string, Record<string, unknown>>; scope?: BotRecord["toolScope"]; approval?: "ask" | "full"; needsSignIn?: string[]; probe?: typeof probeMcpServer; oauth?: ChatAppsMcpOAuth; startupProbes?: boolean } = {}) {
+function setup(options: { keys?: Parameters<typeof createChatAppsMcp>[0]["keys"]; servers?: Record<string, Record<string, unknown>>; scope?: BotRecord["toolScope"]; approval?: "ask" | "full"; needsSignIn?: string[]; probe?: typeof probeMcpServer; oauth?: ChatAppsMcpOAuth; startupProbes?: boolean; probeAs?: (server: { bot?: string }) => { id?: string; cwd?: string } } = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), "omb-chat-apps-mcp-"));
   cleanup.push(() => removeTempDir(dataDir));
   const threads = new Map<string, Message[]>();
@@ -74,6 +75,8 @@ function setup(options: { servers?: Record<string, Record<string, unknown>>; sco
     oauth: options.oauth ?? { authState: (name) => (options.needsSignIn?.includes(name) ? "needs-sign-in" : "none"), accessToken: async () => null, requireSignIn: () => {} },
     startupProbes: options.startupProbes ?? false,
     ...(options.probe ? { probe: options.probe } : {}),
+    ...(options.probeAs ? { probeAs: options.probeAs } : {}),
+    ...(options.keys ? { keys: options.keys } : {}),
     log: (line) => lines.push(line),
   });
   cleanup.push(() => { mcp.close(); apps.close(); });
@@ -312,6 +315,17 @@ describe("mounts and probes", () => {
     expect(probe).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a command server for its background probe the way the bots' turns start it, never beside the server", async () => {
+    const probe = vi.fn(async () => ({ ok: false as const, error: "offline" }));
+    const probeAs = vi.fn((server: { bot?: string }) => (server.bot ? { id: server.bot, cwd: `/data/workspaces/${server.bot}` } : {}));
+    const { mcp, servers } = setup({ probe, probeAs, servers: { board: { ...board(), enabled: true }, own: { ...board(), enabled: true, bot: "bot-scout" } } });
+    expect(mcp.turnMounts({ board: board(), own: board() })).toEqual({});
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(2));
+    // `asBot` is what makes the probe ask for the bot box (server/mcp-probe.ts); without it the command runs unboxed.
+    expect(probe.mock.calls.map((call) => (call as unknown as [unknown, unknown, unknown, { asBot?: unknown }])[3].asBot)).toEqual([{}, { id: "bot-scout", cwd: "/data/workspaces/bot-scout" }]);
+    expect(Object.keys(servers)).toEqual(["board", "own"]);
+  });
+
   it("tells Settings which stored servers have been seen to offer an app", () => {
     const { mcp, servers } = setup({ probe: vi.fn(async () => ({ ok: false as const, error: "offline" })) });
     servers.board = { ...board(), enabled: true };
@@ -365,6 +379,30 @@ describe("mounts and probes", () => {
     mcp.forgetServer("draw");
     expect(mcp.catalog.get("draw", draw)).toBeUndefined();
   }, 30_000);
+});
+
+describe("a server whose key is kept in the Vault", () => {
+  it("is probed with the value read then, and not at all when its key is off", async () => {
+    const probe = vi.fn<typeof probeMcpServer>(async () => ({ ok: false as const, error: "offline" }));
+    const pointer = "vault:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const server = { type: "http", url: "https://mcp.example.test/mcp", headers: { Authorization: `Bearer ${pointer}` }, enabled: true };
+    let open = true;
+    const keys = {
+      warm: vi.fn(async () => {}),
+      resolve: vi.fn((_name: string, target: Record<string, unknown>) => (open ? { ok: true, server: { ...target, headers: { Authorization: "Bearer sk_fake-probe" } } } : { ok: false, reason: "removed", why: "gone" })),
+    };
+    const { mcp, lines } = setup({ servers: { board: server }, probe, keys: keys as never });
+    mcp.serverChanged("board");
+    await vi.waitFor(() => expect(probe).toHaveBeenCalled());
+    expect((probe.mock.calls[0]![0] as unknown as { headers: Record<string, string> }).headers).toEqual({ Authorization: "Bearer sk_fake-probe" });
+    expect(JSON.stringify(lines)).not.toContain("sk_fake-probe");
+    probe.mockClear();
+    open = false;
+    mcp.serverChanged("board");
+    await vi.waitFor(() => expect(keys.resolve).toHaveBeenCalledTimes(2));
+    await new Promise<void>((done) => { setTimeout(done, 20); });
+    expect(probe).not.toHaveBeenCalled();
+  });
 });
 
 describe("a server that lists tools before anyone signs in", () => {
@@ -440,5 +478,40 @@ describe("a server that lists tools before anyone signs in", () => {
     const { oauth, result } = await startupProbe({ open: { type: "http", url: fake.url, enabled: true } });
     expect(result).toMatchObject({ ok: true });
     expect(oauth.authState("open", fake.url)).toBe("none");
+  });
+});
+
+describe("a bot page's call to one of its bot's MCP servers, through the connector gate", () => {
+  const gateFor = (mcp: ChatAppsMcp, bot: BotRecord, full = false) => {
+    const gate = createConnectorGate({ bot: (id) => (id === bot.id ? bot : undefined), servers: { open: mcp.openServer }, decide: () => {}, log: () => {} });
+    const caller = (engaged = false): ConnectorCaller => ({
+      botId: bot.id, person: null, declared: [{ server: "board", tools: ["show_board", "paint_board", "save_board", "peek_board"] }],
+      fullAccess: () => full, engaged, audit: { label: "page m1", key: `${THREAD}:m1`, threadId: THREAD },
+    });
+    return { gate, caller };
+  };
+
+  it("reads with a tool its own listing marks read-only, and changes only at Full access after a click", async () => {
+    const { mcp, bot } = setup();
+    const { gate, caller } = gateFor(mcp, bot);
+    expect(await gate.call(caller(), { server: "board", tool: "show_board" }, { cards: 5 })).toEqual({ ok: true, result: { cards: 5 } });
+    expect(await gate.call(caller(), { server: "board", tool: "peek_board" }, {})).toEqual({ ok: true, result: "3 cards" });
+    expect(await gate.call(caller(true), { server: "board", tool: "paint_board" }, { color: "red" })).toMatchObject({ ok: false, reason: "needs-access" });
+    const full = gateFor(mcp, bot, true);
+    expect(await full.gate.call(full.caller(false), { server: "board", tool: "paint_board" }, { color: "red" })).toMatchObject({ ok: false, reason: "needs-click" });
+    expect(await full.gate.call(full.caller(true), { server: "board", tool: "paint_board" }, { color: "red" })).toEqual({ ok: true, result: "Painted red" });
+    // A tool only the server's own app may call is not one of the bot's.
+    expect(await full.gate.call(full.caller(true), { server: "board", tool: "save_board" }, {})).toMatchObject({ ok: false, reason: "not-granted" });
+    expect(await gate.list(caller())).toEqual([{ server: "board", label: "board", connected: true, tools: ["show_board", "paint_board", "save_board", "peek_board"] }]);
+  }, 30_000);
+
+  it("refuses a server the bot's selection leaves out, one switched off, and one waiting for a sign-in", async () => {
+    const scoped = setup({ scope: { allow: ["mcp:other:*"] } });
+    expect(await gateFor(scoped.mcp, scoped.bot).gate.call(gateFor(scoped.mcp, scoped.bot).caller(), { server: "board", tool: "show_board" }, {})).toMatchObject({ ok: false, reason: "not-granted" });
+    const off = setup({ servers: { board: { ...board(), enabled: false } } });
+    expect(await gateFor(off.mcp, off.bot).gate.call(gateFor(off.mcp, off.bot).caller(), { server: "board", tool: "show_board" }, {})).toMatchObject({ ok: false, reason: "not-connected" });
+    const signedOut = setup({ servers: { board: { url: "https://mcp.example/board", enabled: true } }, needsSignIn: ["board"] });
+    expect(await gateFor(signedOut.mcp, signedOut.bot).gate.call(gateFor(signedOut.mcp, signedOut.bot).caller(), { server: "board", tool: "show_board" }, {}))
+      .toEqual({ ok: false, reason: "not-connected", status: 409, message: "Connect board in Settings first." });
   });
 });

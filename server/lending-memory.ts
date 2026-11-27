@@ -18,6 +18,14 @@ export const ANCESTOR_FILES = ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGE
 export const FOLDER_ENTRY_CAP = 200;
 const ROOT_ENTRY_CAP = 5_000;
 
+/** A filesystem's clock moves in ticks (about 16 ms on NTFS, a kernel tick on ext4, 2 s on FAT), so two changes inside
+ * one tick leave the same mtime and ctime, and what was read at a stamp this recent may be the first of them. Such a
+ * read is used but never remembered: the next look reads again, until the clock has moved well past the stamp. A stamp
+ * ahead of this clock is never remembered either. */
+const RACY_STAMP_MS = 2_000;
+const settled = (stat: { mtimeNs: bigint; ctimeNs: bigint }, now: number) =>
+  (stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n < BigInt(Math.floor(now) - RACY_STAMP_MS);
+
 /** Cached by identity, size and ctime, which no process can set back. */
 const contentCache = new Map<string, { key: string; hash: string }>();
 function describe(file: string): string | undefined {
@@ -31,8 +39,10 @@ function describe(file: string): string | undefined {
   const key = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
   const cached = contentCache.get(file);
   if (cached?.key === key) return cached.hash;
+  const keep = settled(stat, Date.now());
   let hash: string;
   try { hash = `file:${createHash("sha256").update(readFileSync(file)).digest("hex")}`; } catch { hash = "file:unreadable"; }
+  if (!keep) { contentCache.delete(file); return hash; }
   if (contentCache.size > 50_000) contentCache.clear();
   contentCache.set(file, { key, hash });
   return hash;
@@ -55,6 +65,7 @@ function listing(dir: string, cap: number, through = false): Listing | undefined
   const cacheKey = `${cap}\u0000${dir}`;
   const cached = listingCache.get(cacheKey);
   if (cached?.key === key) return cached;
+  const keep = settled(stat, Date.now());
   const names = new Set<string>();
   let overflow = false;
   try {
@@ -71,6 +82,7 @@ function listing(dir: string, cap: number, through = false): Listing | undefined
     return { key: `${key}:unreadable`, names: new Set(), overflow: true };
   }
   const listed = { key, names, overflow };
+  if (!keep) { listingCache.delete(cacheKey); return listed; }
   if (listingCache.size > 50_000) listingCache.clear();
   listingCache.set(cacheKey, listed);
   return listed;
@@ -110,9 +122,11 @@ export function memoryFiles(workspace: string, workingFolders: readonly string[]
   };
   add("MEMORY.md", join(workspace, "MEMORY.md"));
   add("memory", join(workspace, "memory"));
-  for (const name of [...listing(join(workspace, "memory"), Infinity)?.names ?? []].sort()) if (name !== "log") add(`memory/${name}`, join(workspace, "memory", name));
-  add("memory/log", join(workspace, "memory", "log"));
-  for (const name of [...listing(join(workspace, "memory", "log"), Infinity)?.names ?? []].sort()) add(`memory/log/${name}`, join(workspace, "memory", "log", name));
+  for (const name of [...listing(join(workspace, "memory"), Infinity)?.names ?? []].sort()) if (name !== "log" && name !== "threads") add(`memory/${name}`, join(workspace, "memory", name));
+  for (const folder of ["log", "threads"]) {
+    add(`memory/${folder}`, join(workspace, "memory", folder));
+    for (const name of [...listing(join(workspace, "memory", folder), Infinity)?.names ?? []].sort()) add(`memory/${folder}/${name}`, join(workspace, "memory", folder, name));
+  }
   const present = (dir: string, wanted: readonly string[], listed = listing(dir, ROOT_ENTRY_CAP)) =>
     listed ? wanted.filter((name) => listed.overflow || listed.names.has(name)) : [];
   const harnessLink = (entry: string, path: string) =>
@@ -163,7 +177,7 @@ export function memoryFiles(workspace: string, workingFolders: readonly string[]
     const top = listedRoots.get(dir);
     for (const name of top ? present(dir, ANCESTOR_FILES, top) : ANCESTOR_FILES) add(join(dir, name), join(dir, name));
   }
-  for (const folder of ["memory", "memory/log"]) if (files[folder]?.startsWith("other:")) delete files[folder];
+  for (const folder of ["memory", "memory/log", "memory/threads"]) if (files[folder]?.startsWith("other:")) delete files[folder];
   // Named as the link in the bot's own folder would name it, so a record from before these links stopped counting still
   // matches; under a name of its own if something else stands there, so neither hides the other.
   for (const [name, target] of skillLinks?.own ?? []) {

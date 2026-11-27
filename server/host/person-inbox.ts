@@ -72,6 +72,7 @@ export interface Delivery {
   kind: Item["kind"];
   from: { name: string; email?: string; botId?: string };
   via?: { botId: string; name: string };
+  reason?: InboxItem["reason"];
   to?: Item["to"];
   asker?: string;
   origin?: Origin;
@@ -117,7 +118,15 @@ export interface PersonInboxDeps {
   ensureOwnBot?(email: string): void;
   /** What waits on this inbox's person may have changed: its bot goes out to them again. */
   changed?(threadId: string): void;
+  /** A line reached a person's inbox. */
+  delivered?(item: Item, delivery: Delivery): void;
   now?: () => number;
+}
+
+/** A line's wire with the reason of what it now says, or none. */
+function reasoned(wire: InboxItem, reason: InboxItem["reason"]): InboxItem {
+  const { reason: _was, ...rest } = wire;
+  return reason ? { ...rest, reason } : rest;
 }
 
 export function createPersonInbox(deps: PersonInboxDeps) {
@@ -165,9 +174,8 @@ export function createPersonInbox(deps: PersonInboxDeps) {
     let threadId = standing?.threadId;
     if (standing?.brief) store.patchTask(bot.id, standing.threadId, { title: INBOX_TITLE });
     else if (!standing) {
-      const created = store.createTask(bot.id, INBOX_TITLE, false);
+      const created = store.createTask(bot.id, INBOX_TITLE, false, undefined, undefined, undefined, undefined, undefined, (task) => deps.starters.set(task.threadId, person));
       if (!created) return null;
-      deps.starters.set(created.threadId, person);
       threadId = created.threadId;
     }
     homes[person] = { botId: bot.id, threadId: threadId! };
@@ -214,6 +222,13 @@ export function createPersonInbox(deps: PersonInboxDeps) {
 
   const line = (item: Item) => store.messagesFor(item.threadId).find((message) => message.id === item.id);
 
+  /** The message a line points at in the conversation it came from: the newest one there, so a client can put the person
+   * at it when they open the line. */
+  const focusOf = (threadId: string): { messageId?: string } => {
+    const newest = store.messagesFor(threadId).at(-1)?.id;
+    return newest ? { messageId: newest } : {};
+  };
+
   /** The card that asked, in the conversation it was asked in; undefined once that conversation is gone. An ask that
    * came from no conversation (someone asking for access to a bot) is its own card. */
   const asking = (item: Item) => !item.requestId ? undefined : item.origin
@@ -242,10 +257,11 @@ export function createPersonInbox(deps: PersonInboxDeps) {
   const mark = (threadId: string) => { changedAt.set(threadId, Math.max(now(), (changedAt.get(threadId) ?? 0) + 1)); };
   const touch = (threadId: string) => { mark(threadId); deps.changed?.(threadId); };
 
-  /** The tab a line is listed in: an ask by its card where it was asked, anything else by its answer or the person's done. */
+  /** The tab a line is listed in: an ask by its card where it was asked, anything else by its answer or the person's done.
+   * Finished work the person has read needs nothing more from them, so it leaves the inbox. */
   function tabOf(item: Item, copy?: Message): InboxTab {
     if (item.kind === "ask" && item.requestId) return askWaits(item, copy) ? "needs-you" : "done";
-    return item.done || settled(item) ? "done" : "info";
+    return item.done || settled(item) || (item.kind === "result" && item.seen === true) ? "done" : "info";
   }
 
   /** How many asks in this inbox wait on its person: questions, approvals and work handed on, open here and where they
@@ -286,8 +302,11 @@ export function createPersonInbox(deps: PersonInboxDeps) {
     }
     const wire: InboxItem = {
       kind: delivery.kind, from: delivery.from, ...(delivery.via ? { via: delivery.via } : {}),
-      ...(origin && deps.sees(to, origin.threadId) ? { origin: { ...origin, title: titleOf(origin) } } : {}),
-      ...(delivery.to ? { replies: true as const } : {}),
+      ...(origin && deps.sees(to, origin.threadId)
+        // The message it points at: the newest one in the conversation it came from, so a client can put the person there.
+        ? { origin: { ...origin, title: titleOf(origin), ...(origin.messageId ? {} : focusOf(origin.threadId)) } }
+        : {}),
+      ...(delivery.to ? { replies: true as const } : {}), ...(delivery.reason ? { reason: delivery.reason } : {}),
       ...(delivery.assistant ? { assistant: true as const } : {}),
     };
     const posted = store.appendMessage(at.threadId, delivery.card
@@ -302,6 +321,7 @@ export function createPersonInbox(deps: PersonInboxDeps) {
     };
     items.push(item);
     save();
+    deps.delivered?.(item, delivery);
     mark(at.threadId);
     store.patchTask(at.bot.id, at.threadId, { unread: true });
     if (delivery.representable && deps.representative) void represent(item, delivery, at.bot);
@@ -358,7 +378,7 @@ export function createPersonInbox(deps: PersonInboxDeps) {
       passed = { status: 200, text: `Passed back to ${item.from}, who carries on with it.` };
     } else if (item.to === "person" && item.asker) {
       const delivered = deliver(item.asker, {
-        kind: "message", from: { name: replier.name, email: replier.email }, to: "person", asker: item.person,
+        kind: "message", from: { name: replier.name, email: replier.email }, to: "person", asker: item.person, reason: "replied",
         ...(item.origin ? { origin: item.origin } : {}), text, title: label(item.origin?.threadId ?? ""), notify: "mention", ...(by === "assistant" ? { assistant: true } : {}),
       });
       if (!delivered) return { status: 409, text: `${item.from} has no inbox here, so the answer can't reach them.` };
@@ -440,6 +460,23 @@ export function createPersonInbox(deps: PersonInboxDeps) {
     route,
     answeredIn,
     answer: answerItem,
+    /** One line per conversation that waits on this person: while their line about it is not answered or done, a newer
+     * one takes its words and its place at the top instead of adding another. `created` when it is a new line. */
+    keepOne(to: string, delivery: Delivery & { origin: Origin }): { item: Item; created: boolean } | null {
+      const open = items.findLast((item) => item.person === to && item.kind === delivery.kind && item.origin?.threadId === delivery.origin.threadId && !item.done && !settled(item));
+      const posted = open && line(open);
+      if (!open || !posted) {
+        const item = deliver(to, { ...delivery, quiet: true });
+        return item ? { item, created: true } : null;
+      }
+      store.patchMessage(open.threadId, open.id, { text: delivery.text, ...(posted.inbox ? { inbox: reasoned({ ...posted.inbox, from: delivery.from, ...(posted.inbox.origin ? { origin: { ...posted.inbox.origin, ...delivery.origin } } : {}) }, delivery.reason) } : {}) });
+      Object.assign(open, { text: oneLine(delivery.text, 400), from: delivery.from.name.slice(0, 200), origin: delivery.origin, at: now(), seen: false });
+      if (delivery.from.email) open.fromEmail = delivery.from.email; else delete open.fromEmail;
+      save();
+      touch(open.threadId);
+      store.patchTask(open.botId, open.threadId, { unread: true });
+      return { item: open, created: false };
+    },
     /** The line in this inbox that `messageId` is, when it waits on an answer. */
     replyable(threadId: string, messageId: string): Item | undefined {
       return items.find((item) => item.threadId === threadId && item.id === messageId && item.to !== undefined);
@@ -480,7 +517,7 @@ export function createPersonInbox(deps: PersonInboxDeps) {
         return {
           id: item.id, kind: item.kind, tab: tabOf(item, posted), from: posted.inbox?.from ?? { name: item.from }, ...(posted.inbox?.via ? { via: posted.inbox.via } : {}),
           ...(posted.inbox?.origin ? { origin: posted.inbox.origin } : {}), text: clip(posted.text ?? item.text, ROW_TEXT_MAX), at: item.at, unread: !item.seen,
-          ...(posted.inbox?.replies ? { replies: true as const } : {}), ...(posted.inbox?.answers?.length ? { answers: posted.inbox.answers } : {}),
+          ...(posted.inbox?.replies ? { replies: true as const } : {}), ...(posted.inbox?.reason ? { reason: posted.inbox.reason } : {}), ...(posted.inbox?.answers?.length ? { answers: posted.inbox.answers } : {}),
           ...(item.kind === "ask" && posted.card ? { card: posted.card } : {}),
         };
       });
@@ -495,12 +532,21 @@ export function createPersonInbox(deps: PersonInboxDeps) {
       if (!item.done) { item.done = true; item.seen = true; save(); touch(item.threadId); }
       return "done";
     },
-    /** The person read a line. */
-    markRead(person: string, id: string): boolean {
+    /** The person read a line, or marked it unread again. */
+    markRead(person: string, id: string, read = true): boolean {
       const item = items.find((one) => one.person === person && one.id === id);
       if (!item) return false;
-      if (!item.seen) { item.seen = true; save(); touch(item.threadId); }
+      if (Boolean(item.seen) !== read) { item.seen = read; save(); touch(item.threadId); }
       return true;
+    },
+    /** The person read every line of their inbox that still waits on them; an ask stays open, only unmarked as new. */
+    markAllRead(person: string): number {
+      const unread = items.filter((item) => item.person === person && !item.seen && !settled(item));
+      if (!unread.length) return 0;
+      for (const item of unread) item.seen = true;
+      save();
+      for (const inbox of new Set(unread.map((item) => item.threadId))) touch(inbox);
+      return unread.length;
     },
     /** The person wrote in a conversation: their inbox's list changes when a message from there waited on them. */
     wrote(person: string, threadId: string): void {

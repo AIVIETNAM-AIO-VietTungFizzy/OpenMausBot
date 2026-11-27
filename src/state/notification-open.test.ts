@@ -8,9 +8,6 @@ import type { ServerFrame } from "../../shared/wire";
 import type { Action, AppState, BotAnnouncement } from "./store";
 import { LAST_CONVERSATION_KEY } from "@/lib/last-conversation";
 
-// Threads shown is Advanced mode's: its cases run with the switch put back until that code goes.
-vi.mock("@/lib/simple-only", () => ({ SIMPLE_ONLY: false }));
-
 class FixtureEventSource {
   static opened: FixtureEventSource[] = [];
   onopen: (() => void) | null = null;
@@ -184,6 +181,7 @@ describe("following a notification", () => {
     server = { ...server, tasks: server.tasks!.filter((task) => task.threadId !== "finished") };
     await followNotification();
     expect(scoutNow().threadId).toBe("left-behind");
+    expect(state.notice).toEqual({ kind: "thread-gone", botName: null });
     expect(reads()).toEqual([]);
     stream().send({ kind: "bot", bot: structuredClone(server) });
     await settle();

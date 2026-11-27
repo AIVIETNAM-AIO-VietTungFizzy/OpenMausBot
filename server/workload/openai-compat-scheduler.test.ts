@@ -16,6 +16,8 @@ interface FakeOllama {
   held(): number;
   waitForHeld(count: number): Promise<void>;
   nextMode: ChatMode[];
+  /** Every chat whose last message carries this marker answers with this mode, retries included. */
+  failing: Map<string, ChatMode>;
   closed: number;
   answersAsOllama: boolean;
   close(): Promise<void>;
@@ -27,7 +29,7 @@ async function fakeOllama(options: { answersAsOllama?: boolean; holdChats?: bool
   const waiting: Array<() => void> = [];
   const heldWatchers: Array<() => void> = [];
   const fake = {
-    chats: [] as FakeOllama["chats"], inFlight: 0, maxInFlight: 0, nextMode: [] as ChatMode[], closed: 0,
+    chats: [] as FakeOllama["chats"], inFlight: 0, maxInFlight: 0, nextMode: [] as ChatMode[], failing: new Map<string, ChatMode>(), closed: 0,
     answersAsOllama: options.answersAsOllama ?? true,
   };
   const send = (res: ServerResponse, stream: boolean) => {
@@ -64,7 +66,8 @@ async function fakeOllama(options: { answersAsOllama?: boolean; holdChats?: bool
       fake.inFlight += 1;
       fake.maxInFlight = Math.max(fake.maxInFlight, fake.inFlight);
       res.on("close", () => { fake.inFlight -= 1; fake.closed += 1; });
-      const mode = fake.nextMode.shift() ?? "stream";
+      const marker = typeof last === "string" ? last : JSON.stringify(last);
+      const mode = [...fake.failing].find(([failing]) => marker.includes(failing))?.[1] ?? fake.nextMode.shift() ?? "stream";
       const answer = () => {
         if (res.destroyed) return;
         if (mode === "http-500") { res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: "boom" })); return; }
@@ -211,17 +214,25 @@ describe("shared Ollama admission through the openai-compat driver", () => {
 
   it.each(["http-500", "malformed"] as const)("releases the slot after a %s answer and serves the next request", async (mode) => {
     const { fake, inst, outcome } = await setup();
-    fake.nextMode.push(mode);
+    fake.failing.set("marker-0", mode);
     await inst.adapter.sendTurn(turn(0));
     await inst.adapter.sendTurn(turn(1));
-    await fake.waitForHeld(1);
-    fake.release();
-    expect((await outcome("thread-0")).ok).toBe(false);
-    await fake.waitForHeld(1);
-    fake.release();
-    expect(await outcome("thread-1")).toMatchObject({ ok: true, text: "hello" });
+    // The driver retries a transient failure; each attempt takes the one slot and must give it back.
+    const releaseUntil = async <T>(result: Promise<T>): Promise<T> => {
+      let settled = false;
+      void result.finally(() => { settled = true; });
+      while (!settled) {
+        await Promise.race([fake.waitForHeld(1), result]);
+        fake.release();
+      }
+      return result;
+    };
+    expect((await releaseUntil(outcome("thread-0"))).ok).toBe(false);
+    expect(await releaseUntil(outcome("thread-1"))).toMatchObject({ ok: true, text: "hello" });
+    const attempts = fake.chats.filter((chat) => chat.marker.includes("marker-0")).length;
+    expect(attempts).toBeGreaterThanOrEqual(1);
     const [snapshot] = schedulerSnapshots().schedulers;
-    expect(snapshot!.counters).toMatchObject({ failed: 1, completed: 1 });
+    expect(snapshot!.counters).toMatchObject({ failed: attempts, completed: 1 });
     expect(snapshot!.active).toEqual([]);
   });
 

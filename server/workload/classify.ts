@@ -15,6 +15,10 @@ const WAITED_ON: Record<SideJob, boolean> = {
   "skill-review": false,
   representative: false,
   "status-reply": false,
+  // A person reads its summary through a 10 s route.
+  "skill-burger": true,
+  // The composer's next-line suggestion, shown while the person types.
+  "suggested-reply": true,
 };
 
 export function sideJobWorkload(job: SideJob, botId: string): TurnWorkload {

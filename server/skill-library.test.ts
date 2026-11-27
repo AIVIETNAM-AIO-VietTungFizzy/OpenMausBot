@@ -150,3 +150,54 @@ describe("bundled data-dashboards skill", () => {
     expect(Buffer.byteLength(template)).toBeLessThan(APP_LIMITS.htmlBytes / 4);
   });
 });
+
+describe("bundled connected-app-pages skill", () => {
+  const skills = loadBundledSkills(join(process.cwd(), "skills"));
+  const guide = skills.find((skill) => skill.manifest.id === "connected-app-pages")?.instructions ?? "";
+  const ids = (text: string) => selectBundledSkills(text, [], skills).map((skill) => skill.manifest.id);
+
+  it("mounts for a page or mini app over the person's own apps, and stays out of other turns", () => {
+    for (const text of ["Make me a mini app for my inbox", "build a page that lists my open GitHub issues", "an app that shows my calendar this week"]) {
+      expect(ids(text), text).toContain("connected-app-pages");
+    }
+    for (const text of ["summarize this email", "book a call for Friday", "Build me a sales dashboard", "fix the typo in my biography"]) {
+      expect(ids(text), text).not.toContain("connected-app-pages");
+    }
+  });
+
+  it("teaches the declaration and the page calls, with one worked example that reads and one button that changes", () => {
+    expect(guide).toContain('"gmail:GMAIL_FETCH_EMAILS"');
+    expect(guide).toContain('"mcp:notes:search"');
+    expect(guide).toContain("mausbot.connectors.list()");
+    expect(guide).toContain("mausbot.connectors.call(");
+    expect(guide).toContain("a page someone shares never\ncarries an account");
+    expect(guide.match(/```html/g)).toHaveLength(1);
+  });
+});
+
+describe("bundled phone-connection skill", () => {
+  const skills = loadBundledSkills(join(process.cwd(), "skills"));
+  const guide = skills.find((skill) => skill.manifest.id === "phone-connection")?.instructions ?? "";
+  const ids = (text: string) => selectBundledSkills(text, [], skills).map((skill) => skill.manifest.id);
+
+  it("mounts when the phone can't reach the computer, with no capability, and stays out of other turns", () => {
+    for (const text of ["My phone stopped connecting when I'm away from Wi-Fi", "the app says No route to your computer at 192.168.1.20",
+      "Anywhere, through MausBot doesn't work", "why won't my phone connect on mobile data? my phone won't connect", "how do I pair my phone again?"]) {
+      expect(ids(text), text).toContain("phone-connection");
+    }
+    for (const text of ["call my phone at 5pm", "Write a paragraph about photography", "book a call for Friday", "summarize this email", "check the wifi password in my notes"]) {
+      expect(ids(text), text).not.toContain("phone-connection");
+    }
+  });
+
+  it("tells the cause only from the live Phone link line, gives the fix, and rules out what can't help", () => {
+    expect(guide).toContain("Same Wi-Fi"); expect(guide).toContain("Anywhere, through MausBot");
+    expect(guide).toContain('starts "Phone link:"');
+    expect(guide).toContain("update the MausBot app on that phone");
+    expect(guide).toMatch(/open it once\s+on the same Wi-Fi as this computer/);
+    expect(guide.indexOf("open it once"), "the easy way first").toBeLessThan(guide.indexOf("pair it again"));
+    expect(guide).toContain("never say the link ended or that their app is too old");
+    for (const futile of ["off and on", "Try reconnecting", "force-quitting", "VPN"]) expect(guide).toContain(futile);
+    expect(guide.split("\n").length).toBeLessThanOrEqual(60);
+  });
+});

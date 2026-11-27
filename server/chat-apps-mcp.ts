@@ -12,11 +12,13 @@ import { McpHttpError, McpRpcError } from "./mcp-http.ts";
 import type { McpOAuthManager } from "./mcp-oauth.ts";
 import { withMcpSignIn } from "./mcp-oauth.ts";
 import { probeMcpServer, sendsCredentials, type McpProbeOptions } from "./mcp-probe.ts";
+import type { McpKeys } from "./vault/mcp-keys.ts";
 import { isRemoteMcpServer, parseStoredMcpServer, type StoredMcpServer } from "./mcp-registry.ts";
 import { lenientToolValidator, schemaProblems } from "./mcp-schema-validator.ts";
 import { redactSecretsInText } from "./redact.ts";
 import type { McpRpcAnswer, McpRpcRequest } from "./routes/chat-apps.ts";
 import type { BotRecord, Message, Store } from "./store.ts";
+import type { GateServers } from "./connector-gate.ts";
 
 export const APP_RESOURCE_CACHE_MS = 10 * 60_000;
 const STARTUP_PROBE_DELAY_MS = 20_000;
@@ -42,8 +44,12 @@ export interface ChatAppsMcpDeps {
   store: ChatAppsMcpStore;
   apps: ChatApps;
   storedServers(): Record<string, unknown>;
+  /** A server's `vault:<id>` keys, read when it is probed. */
+  keys?: McpKeys;
   mountedServers(bot: BotRecord): Record<string, McpServerSpec>;
   personMcp?(): readonly string[];
+  /** How a command server is started outside a turn: as the turns of its bot, or of any bot (server/mcp-probe.ts `asBot`). */
+  probeAs?(server: { bot?: string }): NonNullable<McpProbeOptions["asBot"]>;
   oauth: ChatAppsMcpOAuth;
   dataDir?: string;
   catalog?: McpAppCatalog;
@@ -70,6 +76,9 @@ export interface ChatAppsMcp {
   turnMounts(custom: Record<string, McpServerSpec>, toolScope?: unknown): { mcpApps?: Record<string, { extension: boolean }> };
   hasApps(name: string): boolean | undefined;
   probeOptions(name: string, server: StoredMcpServer): McpProbeOptions;
+  /** One of the bot's MCP servers for a call made outside a turn, through the same connection an app's own calls use. A
+   * server each person connects for themselves is not reached this way. */
+  openServer: GateServers["open"];
   serverChanged(name: string): void;
   forgetServer(name: string): void;
   close(): void;
@@ -112,12 +121,25 @@ function redactedDone(done: AppDoneState): AppDoneState {
 
 const rpcError = (status: number, code: number, message: string, extra: Json = {}): McpRpcAnswer => ({ status, body: { error: { code, message }, ...extra } });
 
+/** Whether the bot, in this conversation, runs a change without asking: what an app's change outside a turn follows. */
+export function botApproval(store: Pick<Store, "projectBotForTask">, botId: string, threadId: string): "full" | "confirm" {
+  const task = store.projectBotForTask(botId, threadId);
+  return task && approvalModeFor({ ...task, threadId }) === "full" ? "full" : "confirm";
+}
+
 export function createChatAppsMcp(deps: ChatAppsMcpDeps): ChatAppsMcp {
   const { store, apps } = deps;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line: string) => console.info(`chat apps: ${line}`));
   const catalog = deps.catalog ?? new McpAppCatalog(deps.dataDir ? `${deps.dataDir}/mcp-app-catalog.json` : null);
+  // A command server OpenMausBot starts by itself (the background probe, an app's own connection) runs where the bots'
+  // turns run it: in the bot box where that is on, never beside the server.
+  const asBot = (name: string) => {
+    const stored = storedServer(name, deps.storedServers()[name]);
+    return deps.probeAs?.(stored && !isRemoteMcpServer(stored) ? stored : {}) ?? {};
+  };
   const connections = deps.connections ?? new AppConnections({
+    asBot,
     onTools: (name, server, tools, extensions) => {
       if (storedServer(name, deps.storedServers()[name])?.apps === false) return;
       catalog.recordList(name, server, tools, extensions);
@@ -258,10 +280,7 @@ export function createChatAppsMcp(deps: ChatAppsMcpDeps): ChatAppsMcp {
     return { can: { ...CLOSED }, blocked: { reason, text: appBlockedText(reason, ref?.serverTitle ?? ref?.server) } };
   }
 
-  const approvalOf = (botId: string, threadId: string): "full" | "confirm" => {
-    const task = store.projectBotForTask(botId, threadId);
-    return task && approvalModeFor({ ...task, threadId }) === "full" ? "full" : "confirm";
-  };
+  const approvalOf = (botId: string, threadId: string) => botApproval(store, botId, threadId);
 
   /** Nothing configured and nothing secret-shaped reaches the view. */
   const serverErrorText = (detail: string, server: McpServerSpec): string => {
@@ -325,6 +344,37 @@ export function createChatAppsMcp(deps: ChatAppsMcpDeps): ChatAppsMcp {
     }
     return { status: 200, body };
   }
+
+  const openServer: GateServers["open"] = async (bot, _person, name) => {
+    const stored = storedServer(name, deps.storedServers()[name]);
+    const label = name;
+    if (!stored) return { ok: false, reason: "not-granted", label };
+    if (deps.personMcp?.().includes(name) || !stored.enabled) return { ok: false, reason: "not-connected", label };
+    if (isRemoteMcpServer(stored) && deps.oauth.authState(name, stored.url) === "needs-sign-in") return { ok: false, reason: "not-connected", label };
+    const full = store.bot(bot.id);
+    const mounted = full ? deps.mountedServers(full) : {};
+    if (!full || !Object.hasOwn(mounted, name) || !canUseMcpServer(full.toolScope, name)) return { ok: false, reason: "not-granted", label };
+    const server = await signedIn(name, mounted[name]!);
+    if (!server) return { ok: false, reason: "not-connected", label };
+    const extension = extensionFor(name, server);
+    return {
+      ok: true,
+      server: {
+        label,
+        tools: (signal) => connections.tools(name, server, signal, extension),
+        async call(tool, args, signal) {
+          try {
+            const result = await connections.request(name, server, "tools/call", { name: tool, arguments: args }, signal, extension);
+            return { ok: true, body: isRecord(result) ? result : { content: [] } };
+          } catch (error) {
+            if (error instanceof McpRpcError) return { ok: false, text: serverErrorText(error.detail, server) };
+            if (error instanceof McpHttpError && error.status === 401) return { ok: false, text: `Sign in to ${name} again.` };
+            throw error;
+          }
+        },
+      },
+    };
+  };
 
   async function rpc(request: McpRpcRequest): Promise<McpRpcAnswer> {
     const { bot, threadId, row, method, params } = request;
@@ -393,10 +443,13 @@ export function createChatAppsMcp(deps: ChatAppsMcpDeps): ChatAppsMcp {
       const stored = storedServer(name, deps.storedServers()[name]);
       if (!stored?.enabled || stored.apps === false || stored.runsOn) return;
       if (isRemoteMcpServer(stored) && deps.oauth.authState(name, stored.url) === "needs-sign-in") return;
-      const target = isRemoteMcpServer(stored) ? await signedIn(name, stored) : stored;
+      await deps.keys?.warm(name, stored);
+      const keyed = deps.keys ? deps.keys.resolve(name, stored) : { ok: true as const, server: stored };
+      if (!keyed.ok) return;
+      const target = isRemoteMcpServer(keyed.server) ? await signedIn(name, keyed.server) : keyed.server;
       if (!target) return;
       const probed = { ...target, enabled: true } as StoredMcpServer;
-      const result = await probe(probed, BACKGROUND_PROBE_MS, undefined, probeOptions(name, stored));
+      const result = await probe(probed, BACKGROUND_PROBE_MS, undefined, { ...probeOptions(name, keyed.server), ...(isRemoteMcpServer(probed) ? {} : { asBot: asBot(name) }) });
       if (!result.ok && result.auth === "required" && isRemoteMcpServer(probed) && !sendsCredentials(probed)) deps.oauth.requireSignIn(name, probed.url);
       log(`probed ${name}: ${result.ok ? `apps=${catalog.get(name, stored)?.apps === true}` : result.auth === "required" ? "needs sign-in" : "failed"}`);
     }).catch((error: unknown) => log(`probe of ${name} failed: ${String(error)}`));
@@ -425,7 +478,7 @@ export function createChatAppsMcp(deps: ChatAppsMcpDeps): ChatAppsMcp {
   startup?.unref?.();
 
   const service: ChatAppsMcp = {
-    catalog, connections, recordMcpAppCall, access, rpc, turnMounts, probeOptions, serverChanged,
+    catalog, connections, recordMcpAppCall, access, rpc, turnMounts, probeOptions, serverChanged, openServer,
     hasApps(name) {
       const raw = deps.storedServers()[name];
       return raw && typeof raw === "object" ? catalog.get(name, raw as Record<string, unknown>)?.apps : undefined;

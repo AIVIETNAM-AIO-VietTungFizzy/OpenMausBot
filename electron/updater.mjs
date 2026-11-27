@@ -28,6 +28,7 @@ let updaterCoordinator = null;
 let pageAllowed = () => false;
 let quiet = null;
 let launch = null;
+const stateListeners = new Set();
 /** Where these updaters install without asking anything: Squirrel.Mac, and the per-user NSIS installer run silently. */
 const QUIET_PLATFORMS = new Set(["darwin", "win32"]);
 
@@ -113,6 +114,9 @@ function setState(patch) {
   const { messageCode: _stale, messageKey: _key, messageParams: _params, ...kept } = state;
   state = { ...(Object.hasOwn(patch, "message") ? kept : state), ...patch };
   if (quiet && patch.status === "error") installFailed(quietRecord());
+  for (const listener of stateListeners) {
+    try { listener(view()); } catch {}
+  }
   try {
     const contents = win?.webContents;
     if (contents && pageAllowed({ sender: contents, senderFrame: contents.mainFrame })) contents.send("update:state", view());
@@ -124,7 +128,36 @@ export function sendUpdaterState() {
   setState({});
 }
 
-export function registerUpdaterIpc({ pageAllowed: allowed }) {
+/** How long a server's page's answer stands before it may ask again: one click never opens a second dialog. */
+export const SERVER_PAGE_ASK_COOLDOWN_MS = 10_000;
+let serverPageAsk = null;
+
+async function askForServerPage(confirmRestart, server) {
+  if (!updaterCoordinator) return "unavailable";
+  if (state.status !== "downloaded") await updaterCoordinator.check(true);
+  if (state.status === "downloaded") {
+    if (!(await confirmRestart(state.version ?? "", server))) return "later";
+    updaterCoordinator.install();
+    return "installing";
+  }
+  if (state.status === "downloading" || state.status === "preparing" || state.status === "available") return "downloading";
+  return state.status === "error" ? "failed" : "current";
+}
+
+/** What a server's page learns when it asks for this app's own update; never the updater's state. Asks at once share
+ * one answer, and that answer stands for SERVER_PAGE_ASK_COOLDOWN_MS. `server`: the asking page's address, for the dialog. */
+export function updateForServerPage(confirmRestart, server = "", now = Date.now) {
+  if (serverPageAsk && (!serverPageAsk.done || now() - serverPageAsk.done < SERVER_PAGE_ASK_COOLDOWN_MS)) return serverPageAsk.answer;
+  const ask = { done: 0, answer: null };
+  ask.answer = askForServerPage(confirmRestart, server).finally(() => { ask.done = now(); });
+  serverPageAsk = ask;
+  return ask.answer;
+}
+
+/** `serverPage`: the address of the page this app's window shows when it may ask for this app's update
+ * (`update:for-server-page`), a server from the Server menu newer than the app; null for any other sender. Nothing restarts
+ * until `confirmRestart`, this app's own dialog naming that address, says so. */
+export function registerUpdaterIpc({ pageAllowed: allowed, serverPage = () => null, confirmRestart = async () => false }) {
   pageAllowed = allowed;
   const guarded = (channel, handler) => (event) => {
     if (!pageAllowed(event)) throw new Error(`${channel} is only available in this app's window`);
@@ -133,12 +166,39 @@ export function registerUpdaterIpc({ pageAllowed: allowed }) {
   ipcMain.handle("update:get-state", guarded("update:get-state", view));
   ipcMain.handle("update:check", guarded("update:check", () => updaterCoordinator?.check(true)));
   ipcMain.handle("update:install", guarded("update:install", () => updaterCoordinator?.install()));
+  ipcMain.handle("update:for-server-page", (event) => {
+    const server = serverPage(event);
+    if (!server) throw new Error("update:for-server-page is only available to the page this app's window shows");
+    return updateForServerPage(confirmRestart, server);
+  });
   ipcMain.handle("update:seen", guarded("update:seen", () => {
     if (!launch?.updated) return;
     updateSeen(quietRecord());
     launch = { ...launch, updated: null };
     setState({});
   }));
+}
+
+/** This app's own update for Update all on Settings → Devices: its state as the window sees it, a check, the install
+ * (a restart, or the hand-off to a terminal) and each new state. A build without the updater has no state. */
+export function appUpdater() {
+  return {
+    state: () => (updaterCoordinator ? view() : null),
+    check: () => updaterCoordinator?.check(true) ?? Promise.resolve(),
+    install: () => updaterCoordinator?.install(),
+    onState: (listener) => {
+      stateListeners.add(listener);
+      return () => stateListeners.delete(listener);
+    },
+  };
+}
+
+/** How an update reaches this computer with nobody at it: installed at a quiet moment ("by-itself"), on the person's
+ * Restart ("restart"), through their package manager ("package"), or not at all from this app ("none"). */
+export function unattendedUpdates() {
+  if (!updaterCoordinator) return "none";
+  if (quiet) return "by-itself";
+  return state.installMode === "handoff" ? "package" : "restart";
 }
 
 // macOS keeps the process (and updater) alive after its window closes, so each new window is retargeted here.

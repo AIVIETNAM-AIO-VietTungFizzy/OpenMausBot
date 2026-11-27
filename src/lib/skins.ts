@@ -1,21 +1,10 @@
+import { SKIN_IDS } from "../../shared/app-settings";
 import { paintAuroraField } from "./aurora-field";
+import { syncBrowserChrome } from "./browser-chrome";
 import { hasPriorRun } from "./prior-run";
+import { windowPrefChanged } from "./window-pref-changes";
 
-export const SKIN_IDS = [
-  "midnight",
-  "atelier",
-  "foundry",
-  "lagoon",
-  "graphite",
-  "linen",
-  "dusk",
-  "daylight",
-  "meadow",
-  "pop",
-  "halloween",
-  "diwali",
-  "aurora",
-] as const;
+export { SKIN_IDS };
 export type SkinId = (typeof SKIN_IDS)[number];
 
 export type Skin = {
@@ -108,6 +97,7 @@ export function subscribeSkin(listener: () => void): () => void {
 function paintSkin(id: SkinId): void {
   document.documentElement.dataset.skin = id;
   if (id === "aurora") paintAuroraField();
+  syncBrowserChrome();
   for (const listener of listeners) listener();
   // On Windows the caption buttons sit in a native overlay the main process paints, out of CSS's reach.
   try {
@@ -136,6 +126,7 @@ function followSystem(follow: boolean): void {
 export function wearSkin(value: unknown): void {
   if (!isSkinId(value)) return;
   document.documentElement.dataset.skin = value;
+  syncBrowserChrome();
   for (const listener of listeners) listener();
 }
 
@@ -146,6 +137,7 @@ export function applySkinChoice(choice: SkinChoice): void {
   }
   followSystem(choice === "system");
   paintSkin(resolveSkin(choice));
+  windowPrefChanged();
 }
 
 export function applySkin(id: SkinId): void {

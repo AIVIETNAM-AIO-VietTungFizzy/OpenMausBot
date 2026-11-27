@@ -18,6 +18,8 @@ export interface CloudMachine {
   unreachable?: { cause: CloudUnreachableCause; since: number };
   /** Only for a plan that sleeps when idle: whether it is awake now, as the Admin says. */
   power?: import("./cloud-power.mjs").CloudPower;
+  /** An operation of the Admin's own has it down now: an update, resize, move, restore or start (cloud-operation.mjs). */
+  operation?: import("./cloud-operation.mjs").CloudOperation;
   /** The Admin lets this account's computer move to it now (its `moves` gate). */
   moves?: true;
   /** It ended (a trial not paid, a plan cancelled) and the Admin still holds it until it is deleted. `homecoming`: the one
@@ -137,6 +139,7 @@ export declare const CLOUD_TEAM_ROLES: readonly CloudTeamRole[];
 /** owner → Super admin, admin → Admin, member → User, in `t`'s language (English by default). */
 export declare function teamRoleLabel(role: string | null | undefined, t?: (key: string, params?: Record<string, unknown>) => string): string;
 export declare function parseCloudTeams(input: unknown): CloudTeam[];
+export declare function parseCloudLanding(input: unknown, teams: readonly CloudTeam[]): { teamId: string } | null;
 export declare function cloudUnreachableCause(state: unknown, origin?: string | null): "host" | "no_answer" | null;
 export declare function cloudUnreachableText(state: unknown, origin?: string | null, t?: (key: string, params?: Record<string, string | number>) => string): string | null;
 export declare function parseCloudPurchase(input: unknown): CloudPurchase | null;

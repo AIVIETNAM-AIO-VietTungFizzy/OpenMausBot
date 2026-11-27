@@ -1,7 +1,13 @@
 import { hintSeen, hintSeenPatch, type OnboardingStatus } from "@/lib/onboarding";
 
-/** The What's new popup's campaign: each person sees it once. A new id shows it once more. */
-export const WHATS_NEW_NOTICE = "whats-new-2026-11";
+/** "MausBot is better with your team": once per person whom What's new has nothing for (a Team Cloud's members), on every
+ * surface but a branded build or an organization's desktop. On a Team Cloud its record is each person's (TEAM_PERSONAL_HINTS). */
+export const TEAMS_NOTICE = "teams-2026-11b";
+/** What's new, the new Cloud, Team and the sponsor's slides: each person sees it once, as the launch's notice. A new id shows
+ * it once more. Seeing it counts as seeing the Teams popup and the sponsor's card. On a Team Cloud its record is each person's. */
+export const WHATS_NEW_NOTICE = "whats-new-2026-11b";
+/** The earlier What's new, with the new Cloud and Team only. */
+export const EARLIER_WHATS_NEW_NOTICE = "whats-new-2026-11";
 export const UPDATES_CONSENT_NOTICE = "updates-consent";
 /** The Simple mode popup, once per browser (simple-mode-prompt.ts keeps whether it was closed). */
 export const SIMPLE_MODE_NOTICE = "simple-mode-prompt";
@@ -11,28 +17,42 @@ export const CLOUD_NOTICE = "cloud-notice";
 export const STAR_NOTICE = "github-star-dismissed";
 /** Bots on this computer and on another place of the person's (two-places.ts): dismissed per place, by main. */
 export const TWO_PLACES_NOTICE = "two-places";
+/** "This computer and My Cloud together" is on by default now: once per person on this computer (main keeps that). */
+export const TOGETHER_NOTICE = "together-default";
 export const PRODUCT_HUNT_NOTICE = "product-hunt-launch-2026-10";
 export const PRODUCT_HUNT_URL = "https://www.producthunt.com/products/mausbot";
 export const PRODUCT_HUNT_UNTIL = Date.UTC(2026, 10, 1);
 export const BOAT_OFFER_NOTICE = "boat-credit-2026-11";
 /** The Move from Grok Bot popup: each person sees it once, first of all, after their welcome. */
 export const GROK_MOVE_NOTICE = "grok-move-2026-11";
+/** The sponsor's card for ModelGo, now What's new's last slide: kept as seen with it, and listed in Announcements. */
+export const MODELGO_OFFER_NOTICE = "modelgo-offer-2026-11";
+/** Update MausBot on your phone: once per phone with an older app after this computer's secure link ended. */
+export const PHONE_UPDATE_NOTICE = "phone-app-update";
+/** A card from the project's announcements file (src/lib/announcements.ts keeps which ones each person saw, and allows one a
+ * launch): after every notice someone must act on and every built-in offer, and it may follow the launch's notice once that
+ * is closed, after the product-updates question. */
+export const ANNOUNCEMENT_NOTICE = "announcement";
 
 /**
- * Every notice, in the order a launch asks them: one launch shows one notice, the first one due, and only the product-updates
- * question may follow it there. The rest wait for later launches, in this order.
+ * Every notice, in the order a launch asks them: one launch shows one notice first, the first one due, and only FOLLOWERS may
+ * come after it there. The rest wait for later launches, in this order.
  */
 export const NOTICES = [
+  TEAMS_NOTICE,
   GROK_MOVE_NOTICE,
-  SIMPLE_MODE_NOTICE,
+  PHONE_UPDATE_NOTICE,
   WHATS_NEW_NOTICE,
+  SIMPLE_MODE_NOTICE,
   UPDATES_CONSENT_NOTICE,
   TWO_PLACES_NOTICE,
   PRODUCT_HUNT_NOTICE,
   CLOUD_INTRO,
   CLOUD_TRIAL_NOTICE,
   CLOUD_NOTICE,
+  TOGETHER_NOTICE,
   BOAT_OFFER_NOTICE,
+  ANNOUNCEMENT_NOTICE,
   STAR_NOTICE,
 ] as const;
 
@@ -40,11 +60,28 @@ export type NoticeId = (typeof NOTICES)[number];
 
 export type NoticeFacts = Record<NoticeId, boolean | null>;
 
-/** `launch`: the notice this launch already showed (launchNotice), the only one besides the product-updates question that
- * may show again in it. */
-export function nextNotice(facts: NoticeFacts, seen: (id: NoticeId) => boolean, launch: NoticeId | null = null): NoticeId | null {
+/** What may still come in a launch another notice took: the product-updates question and a card from the announcements
+ * file, which everyone is to see on the first launch they may show in. Each in its place in NOTICES. */
+export const FOLLOWERS: readonly NoticeId[] = [UPDATES_CONSENT_NOTICE, ANNOUNCEMENT_NOTICE];
+/** The followers that are cards of their own: they never go ahead of a notice to act on, nor replace a card still up. */
+const FOLLOWING_CARDS: readonly NoticeId[] = [ANNOUNCEMENT_NOTICE];
+/** Notices the person has to act on. An announcement card never goes ahead of one, even one left for a later launch: it
+ * waits for that launch and follows it there. */
+export const MUST_ACT: readonly NoticeId[] = [GROK_MOVE_NOTICE, PHONE_UPDATE_NOTICE, CLOUD_TRIAL_NOTICE, CLOUD_NOTICE];
+
+/** `launch`: the notice this launch already showed (launchNotice), the only one besides FOLLOWERS that may show again in it.
+ * `closed`: that notice was closed in this page, so it doesn't come back however its facts read. The following cards follow
+ * only once the launch's notice is gone, so two cards never share the corner. */
+export function nextNotice(facts: NoticeFacts, seen: (id: NoticeId) => boolean, launch: NoticeId | null = null, closed = false): NoticeId | null {
+  const launchUp = launch !== null && !closed && !seen(launch) && facts[launch] !== false;
+  let held = false;
   for (const id of NOTICES) {
-    if (seen(id) || (launch !== null && id !== launch && id !== UPDATES_CONSENT_NOTICE)) continue;
+    if (seen(id)) continue;
+    if ((closed || (launch !== null && id !== launch)) && !FOLLOWERS.includes(id)) {
+      if (id !== launch && MUST_ACT.includes(id) && facts[id] !== false) held = true;
+      continue;
+    }
+    if (FOLLOWING_CARDS.includes(id) && id !== launch && (held || launchUp)) continue;
     if (facts[id] === null) return null;
     if (facts[id]) return id;
   }
@@ -85,6 +122,16 @@ export function noticeSeen(record: OnboardingStatus | undefined, id: string): bo
 export function dismissNotice(record: OnboardingStatus | undefined, id: string): { onboarding: { hintsSeen: string[] } } | null {
   store(id, "1");
   return hintSeenPatch(record, id);
+}
+
+/** Per phone, so one paired later with an older app brings the card back once; config keeps hints of at most 60 characters. */
+export const phoneUpdateHint = (deviceId: string) => `${PHONE_UPDATE_NOTICE}:${deviceId.slice(0, 8)}`;
+
+export function dismissNotices(record: OnboardingStatus | undefined, ids: readonly string[]): { onboarding: { hintsSeen: string[] } } | null {
+  const before = record?.hintsSeen ?? [];
+  for (const id of ids) store(id, "1");
+  const added = [...new Set(ids)].filter(id => !before.includes(id));
+  return added.length ? { onboarding: { hintsSeen: [...before, ...added] } } : null;
 }
 
 export function localDay(now: number): string {

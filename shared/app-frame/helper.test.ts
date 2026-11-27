@@ -5,7 +5,7 @@ import { ROOM_VIEW_ONLY, type AppDocument } from "../app.ts";
 import { createAppBridge, type AppBridge } from "./bridge.ts";
 import { BOT_HTML_CSP, BOT_HTML_NETWORK } from "./csp.ts";
 import { ROOM_CAN } from "./document.ts";
-import { APP_HELPER_SOURCE, APP_ROOM_HELPER_SOURCE } from "./helper.ts";
+import { APP_HELPER_SOURCE, APP_ROOM_HELPER_SOURCE, APP_SELECTION_METHOD } from "./helper.ts";
 
 const DOC: AppDocument = {
   v: 1, messageId: "m1", rev: 0, srcdoc: "", csp: BOT_HTML_CSP,
@@ -24,7 +24,9 @@ interface Scene {
   under?: Array<{ position?: "absolute" | "fixed"; width: number | "window"; height: number | "window"; freed?: number }>;
 }
 
-function boot(engaged = true, options: { scene?: Scene; start?: number; loaded?: boolean; room?: boolean } = {}) {
+function boot(engaged = true, options: {
+  scene?: Scene; start?: number; loaded?: boolean; room?: boolean; can?: Partial<AppDocument["can"]>; rpc?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+} = {}) {
   const room = options.room === true;
   const page = new Window();
   pages.push(page);
@@ -32,10 +34,18 @@ function boot(engaged = true, options: { scene?: Scene; start?: number; loaded?:
   const loads = new Set<() => void>();
   const observers = new Set<() => void>();
   let bridge: AppBridge;
+  // Every hop between the page and its host is a task of this fake frame's, counted until it has run, so a test can wait
+  // for the frame to go quiet instead of for a time: a timer's wait is about 16 ms on Windows, and a report takes three.
+  let pending = 0;
+  const task = (run: () => void) => {
+    pending += 1;
+    setTimeout(() => { try { run(); } finally { pending -= 1; } }, 0);
+  };
   const parent = {
     postMessage(data: unknown) {
       const copy = structuredClone(data);
-      setTimeout(() => bridge.handleMessage({ source: frame, data: copy }), 0);
+      if ((copy as { method?: string }).method === APP_SELECTION_METHOD) seen.selections.push((copy as { params: unknown }).params);
+      task(() => bridge.handleMessage({ source: frame, data: copy }));
     },
   };
   const positions = new Map<unknown, string>();
@@ -49,7 +59,7 @@ function boot(engaged = true, options: { scene?: Scene; start?: number; loaded?:
     },
     postMessage(data: unknown) {
       const copy = structuredClone(data);
-      setTimeout(() => { for (const listener of listeners) listener({ source: parent, data: copy }); }, 0);
+      task(() => { for (const listener of listeners) listener({ source: parent, data: copy }); });
     },
     getComputedStyle: (element: unknown) => ({ position: positions.get(element) ?? "static" }),
   };
@@ -75,22 +85,22 @@ function boot(engaged = true, options: { scene?: Scene; start?: number; loaded?:
     });
     (document as unknown as { elementsFromPoint(): Element[] }).elementsFromPoint = () => [...under, document.body, root];
   }
-  const seen = { messages: [] as string[], links: [] as string[], contexts: [] as unknown[], heights: [] as number[] };
+  const seen = { messages: [] as string[], links: [] as string[], contexts: [] as unknown[], heights: [] as number[], selections: [] as unknown[] };
   bridge = createAppBridge({
-    doc: room ? { ...DOC, can: { ...ROOM_CAN }, room: true } : DOC,
+    doc: room ? { ...DOC, can: { ...ROOM_CAN }, room: true } : { ...DOC, can: { ...DOC.can, ...options.can } },
     hostContext: { theme: "dark", styles: { variables: { "--color-text-primary": "#fafafa", "not-a-variable": "x" } } },
     source: () => frame,
     hostVersion: "1",
     adapter: {
       post: (message) => (frame.postMessage as (data: unknown) => void)(message),
-      callRpc: async () => ({}),
+      callRpc: async (method, params) => (options.rpc ? options.rpc(method, params) : {}),
       sendMessage: async (text) => { seen.messages.push(text); },
       openLink: (url) => { seen.links.push(url); },
       setContext: (update) => { seen.contexts.push(update); },
       resize: (height) => {
         seen.heights.push(height);
         frame.innerHeight = height;
-        for (const observed of observers) setTimeout(observed, 0);
+        for (const observed of observers) task(observed);
       },
       engaged: () => engaged,
       teardownRequested: () => {},
@@ -103,13 +113,23 @@ function boot(engaged = true, options: { scene?: Scene; start?: number; loaded?:
   }
   // The helper's free names, bound to this fake frame: it runs exactly as written.
   const run = new Function("window", "document", "ResizeObserver", "requestAnimationFrame", room ? APP_ROOM_HELPER_SOURCE : APP_HELPER_SOURCE);
-  run(frame, document, scene ? FakeResizeObserver : undefined, (callback: () => void) => setTimeout(callback, 0));
+  run(frame, document, scene ? FakeResizeObserver : undefined, (callback: () => void) => task(callback));
   return {
     bridge, seen, frame, root,
     load: () => { options.loaded = true; for (const listener of loads) listener(); },
-    reflow: () => { for (const observed of observers) setTimeout(observed, 0); },
+    reflow: () => { for (const observed of observers) task(observed); },
+    /** Resolves once no task of the frame's is waiting to run: what a reflow started has reached the host, or come to nothing. */
+    quiet: async () => {
+      for (const deadline = Date.now() + 5_000; pending > 0;) {
+        if (Date.now() > deadline) throw new Error(`the frame still had ${pending} task(s) waiting after 5 s`);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    },
     mausbot: () => frame.mausbot as {
       send(text: string): Promise<void>; open(url: string): Promise<void>; setContext(text: string): Promise<void>; theme: string; room: boolean;
+      data: { query(sql: string, params?: unknown): Promise<unknown> };
+      state: { get(key: string): Promise<unknown>; set(key: string, value?: unknown): Promise<void>; keys(): Promise<string[]> };
+      connectors: { call(name: string, tool: string, args?: unknown): Promise<unknown>; list(): Promise<unknown[]> };
     },
   };
 }
@@ -121,7 +141,7 @@ async function settled(page: ReturnType<typeof boot>) {
   for (let round = 0; round < 20 && count !== page.seen.heights.length; round++) {
     count = page.seen.heights.length;
     page.reflow();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await page.quiet();
   }
   return page.seen.heights;
 }
@@ -149,6 +169,55 @@ describe("the bot-page helper", () => {
     await page.mausbot().setContext("Looking at March");
     await expect.poll(() => page.seen.contexts.length).toBe(1);
     expect(page.seen.contexts[0]).toEqual({ content: [{ type: "text", text: "Looking at March" }] });
+  });
+
+  it("reads data and keeps state through the bridge when the page declared them, with no click", async () => {
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    const saved: Record<string, unknown> = {};
+    const page = boot(false, {
+      can: { data: true, state: true },
+      rpc: async (method, params) => {
+        asked.push([method, params]);
+        if (method === "mausbot/data/query") return { columns: [{ name: "n", type: "INTEGER" }], rows: [{ n: 1 }], truncated: false };
+        if (method === "mausbot/state/set") { if ("value" in params) saved[params.key as string] = params.value; else delete saved[params.key as string]; return {}; }
+        if (method === "mausbot/state/get") return params.key as string in saved ? { value: saved[params.key as string] } : {};
+        return { keys: Object.keys(saved) };
+      },
+    });
+    expect(await page.mausbot().data.query("SELECT ? AS n", [1])).toEqual({ columns: [{ name: "n", type: "INTEGER" }], rows: [{ n: 1 }], truncated: false });
+    await page.mausbot().state.set("filter", { region: "north" });
+    expect(await page.mausbot().state.get("filter")).toEqual({ region: "north" });
+    expect(await page.mausbot().state.keys()).toEqual(["filter"]);
+    await page.mausbot().state.set("filter");
+    expect(await page.mausbot().state.get("filter")).toBeUndefined();
+    expect(asked[0]).toEqual(["mausbot/data/query", { sql: "SELECT ? AS n", params: [1] }]);
+    expect(asked[4]).toEqual(["mausbot/state/set", { key: "filter" }]);
+  });
+
+  it("calls declared connector tools and lists them through the bridge, answering with the tool's result alone", async () => {
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    const page = boot(false, {
+      can: { connectors: [{ connector: "gmail", tools: ["GMAIL_FETCH_EMAILS"] }] },
+      rpc: async (method, params) => {
+        asked.push([method, params]);
+        return method === "mausbot/connectors/list"
+          ? { connectors: [{ connector: "gmail", label: "Gmail", connected: true, tools: ["GMAIL_FETCH_EMAILS"] }] }
+          : { result: { messages: [{ id: "1" }] }, truncated: true };
+      },
+    });
+    expect(await page.mausbot().connectors.call("gmail", "GMAIL_FETCH_EMAILS", { max_results: 3 })).toEqual({ messages: [{ id: "1" }] });
+    expect(await page.mausbot().connectors.list()).toEqual([{ connector: "gmail", label: "Gmail", connected: true, tools: ["GMAIL_FETCH_EMAILS"] }]);
+    expect(asked).toEqual([
+      ["mausbot/connectors/call", { connector: "gmail", tool: "GMAIL_FETCH_EMAILS", arguments: { max_results: 3 }, engaged: false }],
+      ["mausbot/connectors/list", {}],
+    ]);
+    await expect(page.mausbot().connectors.call("gmail", "GMAIL_SEND_EMAIL")).rejects.toThrow("This page did not declare GMAIL_SEND_EMAIL");
+  });
+
+  it("rejects data and state with the reason when the page did not declare them", async () => {
+    const page = boot();
+    await expect(page.mausbot().data.query("SELECT 1")).rejects.toThrow('This page did not declare "data"');
+    await expect(page.mausbot().state.keys()).rejects.toThrow('This page did not declare "state"');
   });
 
   it("in a room, says so, and its send and setContext resolve without asking the host; a page that asks anyway is refused", async () => {
@@ -192,6 +261,53 @@ describe("the bot-page helper", () => {
     const original = page.mausbot();
     expect(() => { "use strict"; (page.frame as { mausbot: unknown }).mausbot = {}; }).toThrow();
     expect(page.mausbot()).toBe(original);
+  });
+});
+
+describe("the text the person selects in a bot page", () => {
+  const selectText = (page: ReturnType<typeof boot>, text: string) => {
+    const document = page.root.ownerDocument;
+    const paragraph = document.createElement("p");
+    paragraph.textContent = text;
+    document.body.appendChild(paragraph);
+    document.getSelection()!.selectAllChildren(paragraph);
+    document.dispatchEvent(new document.defaultView!.Event("selectionchange"));
+  };
+
+  it("is reported once it settles, and reported gone once, so the host can offer to cite it", async () => {
+    const page = boot();
+    await expect.poll(() => page.bridge.initialized).toBe(true);
+    selectText(page, "Total: 42");
+    await expect.poll(() => page.seen.selections.length).toBe(1);
+    expect(page.seen.selections[0]).toMatchObject({ text: "Total: 42", left: expect.any(Number), bottom: expect.any(Number) });
+    const document = page.root.ownerDocument;
+    document.getSelection()!.removeAllRanges();
+    document.dispatchEvent(new document.defaultView!.Event("selectionchange"));
+    await expect.poll(() => page.seen.selections.length).toBe(2);
+    expect(page.seen.selections[1]).toEqual({ text: "" });
+    document.dispatchEvent(new document.defaultView!.Event("selectionchange"));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(page.seen.selections).toHaveLength(2);
+  });
+
+  it("waits until the person stops changing it, so a selection still being made is not offered", async () => {
+    const page = boot();
+    await expect.poll(() => page.bridge.initialized).toBe(true);
+    for (const text of ["T", "To", "Tot", "Tota", "Total: 42"]) {
+      selectText(page, text);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    await expect.poll(() => page.seen.selections.length).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(page.seen.selections).toEqual([expect.objectContaining({ text: "Total: 42" })]);
+  });
+
+  it("is never reported from a room's page", async () => {
+    const page = boot(true, { room: true });
+    await expect.poll(() => page.bridge.initialized).toBe(true);
+    selectText(page, "Total: 42");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(page.seen.selections).toEqual([]);
   });
 });
 

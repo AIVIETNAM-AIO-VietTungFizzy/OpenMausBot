@@ -39,6 +39,9 @@ describe("browser tool shaping", () => {
     expect(Object.keys(slimRead!.inputSchema.properties)).toEqual(["filter"]);
     expect(slimRead!.inputSchema.required).toEqual([]);
     expect(Object.keys(slimOpen!.inputSchema.properties)).toEqual(["url"]);
+    // agent-browser's own description offers the hidden url; the bot reads the open page's instead (email bug 1a1cb892)
+    expect((slimRead as { description?: string }).description).toBe("Read the page open in this browser as agent-readable text. To read another address, open it with agent_browser_open first.");
+    expect(slimOpen).not.toHaveProperty("description");
     expect(readsAroundBrowser({ name: "agent_browser_read", arguments: { url: "http://127.0.0.1:8799/api/config" } })).toBe(true);
     expect(readsAroundBrowser({ name: "agent_browser_read", arguments: { url: "" } })).toBe(true);
     expect(readsAroundBrowser({ name: "agent_browser_read", arguments: { filter: "main" } })).toBe(false);
@@ -120,7 +123,7 @@ describe("browser tool shaping", () => {
   });
 
   it("names only tools the pinned engine advertises", () => {
-    // `agent-browser mcp --tools core` on the pinned 0.37.0 plus OMB's own tools: guidance naming a tool the engine does not list costs a failed call.
+    // `agent-browser mcp --tools core` on the pinned 0.39.0 plus OMB's own tools: guidance naming a tool the engine does not list costs a failed call.
     const advertised = new Set([
       "agent_browser_tools_profiles", "agent_browser_open", "agent_browser_read", "agent_browser_snapshot", "agent_browser_click",
       "agent_browser_fill", "agent_browser_type", "agent_browser_press", "agent_browser_check", "agent_browser_uncheck",

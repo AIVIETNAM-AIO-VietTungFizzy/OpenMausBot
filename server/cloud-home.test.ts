@@ -393,9 +393,11 @@ it("gives the edge only its routing name and the server the contract, never a ga
   expect(server).toMatchObject({ HOME: "/data", OMB_DATA_DIR: "/data/.openmausbot", NODE_COMPILE_CACHE: "/data/.openmausbot/cache/node-compile", OMB_PORT: "8799", OMB_WEBHOOK_PORT: "8800",
     OMB_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_WEBHOOK_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_CLOUD_SECRETS_FD: "3" });
   for (const key of CLOUD_IGNORED_KEYS) expect(server).not.toHaveProperty(key);
-  // The bot box switch reaches the server; an unknown name does not.
-  expect(cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin", OMB_BOT_BOX: "0", OMB_SOMETHING_ELSE: "x" }, "/data").server).toMatchObject({ OMB_BOT_BOX: "0" });
+  // The bot box and image-engines switches reach the server; an unknown name does not.
+  expect(cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin", OMB_BOT_BOX: "0", OMB_IMAGE_ENGINES: "1", OMB_SOMETHING_ELSE: "x" }, "/data").server).toMatchObject({ OMB_BOT_BOX: "0", OMB_IMAGE_ENGINES: "1" });
   expect(cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin", OMB_SOMETHING_ELSE: "x" }, "/data").server).not.toHaveProperty("OMB_SOMETHING_ELSE");
+  // So does the switch that gives Antigravity accounts Google's native CLI, which a Cloud home could otherwise never turn on.
+  expect(cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin", OMB_ANTIGRAVITY_NATIVE_CLI: "1" }, "/data").server).toMatchObject({ OMB_ANTIGRAVITY_NATIVE_CLI: "1" });
   expect(JSON.stringify(server)).not.toContain(token);
   expect(secrets).toEqual({ OMB_CLOUD_BOOTSTRAP_SECRET: secret, ...relay });
   for (const value of Object.values(secrets)) {
@@ -486,6 +488,14 @@ it("holds requests at the edge while the server starts only when the Admin asked
   expect(edgeHold(" 045s ")).toBe("45s");
 });
 
+it("hands the server the tool cache switch, and moves no cache of the server's own", () => {
+  const config = cloudHomeConfiguration(withGateway())!;
+  const server = cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin", OMB_CACHE_ROOT: "on", OMB_CACHE_SWEEP: "on", OMB_CACHE_CAP_TOOLS: "4G", OMB_CACHE_CAP_APP: "1G" }, "/data").server;
+  expect(server).toMatchObject({ OMB_CACHE_ROOT: "on", OMB_CACHE_SWEEP: "on", OMB_CACHE_CAP_TOOLS: "4G", OMB_CACHE_CAP_APP: "1G", HOME: "/data", NODE_COMPILE_CACHE: "/data/.openmausbot/cache/node-compile" });
+  // Only the bot box adds the tools' variables (bot-box/tool-caches.ts), for each box's own HOME.
+  for (const name of ["npm_config_cache", "PIP_CACHE_DIR", "UV_CACHE_DIR", "HF_HUB_CACHE", "XDG_CACHE_HOME"]) expect(server).not.toHaveProperty(name);
+});
+
 it("hands the server the Admin's export-only switch, so an ended Cloud started for its owner's export runs frozen", () => {
   // Seen on a real staging test Cloud on Oct 22: the Admin booted the held Cloud with OMB_CLOUD_EXPORT_ONLY=1, the log said
   // "not passed to the server: … OMB_CLOUD_EXPORT_ONLY …", and it ran its routines every 5 minutes for the whole export
@@ -505,14 +515,14 @@ it("gives the server only an allow-listed environment: a secret added later, a t
   const config = cloudHomeConfiguration(contract())!;
   const env = { ...contract(), PATH: "/usr/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", NODE_ENV: "production", OMB_STATIC_DIR: "/app/dist",
     OMB_CLOUD_BOAT_URL: "https://cloud.example.test/boat", OMB_TTS_DEFAULT_VOICE: "alloy", OMB_CLOUD_AI_URL: "https://cloud.example.test/api/cloud/services/ai",
-    OMB_COMPOSIO_BROKER_URL: "https://broker.example.test", OMB_COMPOSIO_BROKER_TOKEN: "b".repeat(64),
+    OMB_COMPOSIO_BROKER_URL: "https://broker.example.test", OMB_COMPOSIO_BROKER_TOKEN: "b".repeat(64), OMB_COMPOSIO_BROKER: "off",
     OMB_CLOUD_FUTURE_SECRET: "later", OMB_TEST_CLOUD_LEFT_BEHIND_KEY: "k".repeat(43), FLY_API_TOKEN: "fly", SOME_TOKEN: "t", HOME: "/root" };
   const { server, dropped } = cloudHomeChildEnvironments(config, env, "/data");
   expect(server).toMatchObject({ PATH: "/usr/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", NODE_ENV: "production", OMB_STATIC_DIR: "/app/dist",
     OMB_CLOUD_ROLE: "home", OMB_CLOUD_MACHINE_ID: machineId, OMB_CLOUD_ADMIN_URL: "https://cloud.example.test",
     OMB_CLOUD_BOAT_URL: "https://cloud.example.test/boat", OMB_TTS_DEFAULT_VOICE: "alloy", OMB_CLOUD_AI_URL: "https://cloud.example.test/api/cloud/services/ai", HOME: "/data",
     // A staging Cloud may name its connected-apps service; the Cloud registers its own token, never one from outside.
-    OMB_COMPOSIO_BROKER_URL: "https://broker.example.test" });
+    OMB_COMPOSIO_BROKER_URL: "https://broker.example.test", OMB_COMPOSIO_BROKER: "off" });
   for (const name of ["OMB_CLOUD_FUTURE_SECRET", "OMB_TEST_CLOUD_LEFT_BEHIND_KEY", "FLY_API_TOKEN", "SOME_TOKEN", "OMB_COMPOSIO_BROKER_TOKEN"]) {
     expect(server).not.toHaveProperty(name);
     expect(dropped).toContain(name);
@@ -592,13 +602,16 @@ it("ships an edge and a Fly template that keep the server private", () => {
   expect(fly).not.toContain("OMB_HOSTED_");
 });
 
-it("the Cloud launcher starts the server again only when it asks to after a restore, and only a few times in a row", () => {
+it("the Cloud launcher starts the server again when it asks to after a restore or after a crash (with a pause), and only a few times in a row", () => {
   const launcher = readFileSync(join(import.meta.dirname, "cloud-home-start.ts"), "utf8");
   expect(launcher).toContain("const policy = restartPolicy();");
   // The volume is prepared (and the previous machine's lease cleared) through one helper, as `maus`, before any child starts.
   expect(launcher).toContain("const prepare = () => prepareCloudHomeData(home, cloudHomeDataDir(env, home), config.machineId);");
-  expect(launcher.indexOf("prepared = prepare();")).toBeLessThan(launcher.indexOf("runServer();"));
-  expect(launcher).toContain("if (!policy.again(code, stopping)) return false;");
+  expect(launcher.indexOf("prepared = prepare();")).toBeLessThan(launcher.indexOf("\n  runServer();"));
+  expect(launcher).toContain("if (!policy.again(code, stopping, signal)) return false;");
+  expect(launcher).toContain("if (policy.delayMs() > 0) restartTimer = setTimeout(runServer, policy.delayMs());");
+  // A stop during the pause ends the wait, so a stopped home exits at once.
+  expect(launcher).toContain("if (restartTimer) clearTimeout(restartTimer);");
   for (const code of [0, 1, null]) expect(restartPolicy().again(code)).toBe(false);
   expect(restartPolicy().again(RESTART_EXIT_CODE, true)).toBe(false);
   const policy = restartPolicy(() => 0);
@@ -652,6 +665,34 @@ writeFileSync(${JSON.stringify(out)}, JSON.stringify({ secrets, env: process.env
   } finally {
     await removeTempDir(dir);
   }
+});
+
+// The supervisor runs on Linux only; Windows has no inherited descriptor 4 to write to.
+it.skipIf(process.platform === "win32")("gives the server a pipe to the supervisor's clock keeper only when asked, which carries its kicker's check line", async () => {
+  const dir = directory();
+  const script = join(dir, "kick.mjs");
+  writeFileSync(script, `
+const { clockKicker, CLOCK_FD_ENV } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, "cloud-clock.ts")).href)});
+const named = process.env[CLOCK_FD_ENV] ?? "none";
+const kick = clockKicker();
+kick?.(); kick?.();
+process.stdout.write(named + " " + String(process.env[CLOCK_FD_ENV]));
+setTimeout(() => {}, 200);
+`);
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) };
+  const run = async (clockPipe: boolean) => {
+    const child = spawnWithSecrets(process.execPath, [script], env, { OMB_CLOUD_BOOTSTRAP_SECRET: secret }, undefined, true, clockPipe);
+    let out = "", kicked = "";
+    child.stdout?.on("data", (chunk) => { out += chunk; });
+    (child.stdio[4] as NodeJS.ReadableStream | undefined)?.on("data", (chunk) => { kicked += chunk; });
+    await new Promise((resolve) => child.once("close", resolve));
+    return { out, kicked, fds: child.stdio.length };
+  };
+  const piped = await run(true);
+  expect(piped.out).toBe("4 undefined");
+  expect(piped.kicked).toBe("check\n");
+  const plain = await run(false);
+  expect(plain).toEqual({ out: "none undefined", kicked: "", fds: 4 });
 });
 
 it("captures a child's stdout and stderr when asked, and shares this process's otherwise", async () => {
@@ -846,4 +887,31 @@ it("a My Cloud refuses a team claim: it is one person's", () => {
   expect(f.mint(f.sign(JSON.stringify({ member: { email: "ada@acme.test", role: "member" } })))).toEqual({ status: 400, body: { error: "not_a_team" } });
   expect(f.mint(f.sign(JSON.stringify({ team: { id: "team-1" } })))).toEqual({ status: 400, body: { error: "not_a_team" } });
   expect(f.sessions.openPairings()).toHaveLength(0);
+});
+
+it("a Team Cloud with remote access turned off refuses a User's browser sign-in, keeps an Owner's and an Admin's, and every app pairing", () => {
+  const root = directory();
+  let off = true, counter = 0;
+  const now = 1_800_000_000_000;
+  const sessions = new SessionRegistry({ file: join(root, "sessions.json"), now: () => now });
+  const pairing = createCloudPairing({ secret, sessions, team: { id: "team-1", name: "Acme" }, memberBrowserOff: () => off, now: () => now });
+  const mint = (claims: Record<string, unknown>) => {
+    const body = JSON.stringify({ label: "Web browser", ttlSeconds: 120, ...claims });
+    const timestamp = String(Math.floor(now / 1000)), nonce = `nonce-${String(++counter).padStart(12, "0")}`;
+    return pairing.handle({ timestamp, nonce, signature: `v1=${cloudPairingSignature(secret, timestamp, nonce, body)}`, body: Buffer.from(body), source: "203.0.113.9" });
+  };
+  const browser = (email: string, role: string) => mint({ purpose: "browser", owner: email, member: { email, role } });
+  expect(browser("ada@acme.test", "member")).toEqual({ status: 403, body: { error: "remote_access_off" } });
+  expect(browser("ben@acme.test", "admin").status).toBe(200);
+  expect(browser("olive@acme.test", "owner").status).toBe(200);
+  expect(mint({ member: { email: "ada@acme.test", role: "member" } }).status, "the app's pairing stays: it is how the team reaches its Cloud").toBe(200);
+  off = false;
+  expect(browser("ada@acme.test", "member").status).toBe(200);
+  // Turned off again: the User's open browser signs out, the admins' stay.
+  const ada = sessions.exchange({ code: (browser("ada@acme.test", "member").body.credential as string), browser: true, label: "", source: "s" });
+  const ben = sessions.exchange({ code: (browser("ben@acme.test", "admin").body.credential as string), browser: true, label: "", source: "s" });
+  expect(ada.ok && ben.ok).toBe(true);
+  expect(sessions.closeMemberBrowsers()).toBe(1);
+  expect(sessions.list().map((session) => session.email)).toEqual(expect.arrayContaining(["ben@acme.test"]));
+  expect(sessions.list().map((session) => session.email)).not.toContain("ada@acme.test");
 });

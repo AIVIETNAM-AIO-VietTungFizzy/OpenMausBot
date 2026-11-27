@@ -21,7 +21,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function home(probes: Partial<CloudPowerProbes> = {}, onWoke?: () => void, bootedFromSleep = false) {
+function home(probes: Partial<CloudPowerProbes> = {}, onWoke?: () => void, bootedFromSleep = false, onBootWakeRequest?: (at: number) => void) {
   let clock = START;
   const dataDir = mkdtempSync(join(tmpdir(), "omb-cloud-power-"));
   dirs.push(dataDir);
@@ -30,7 +30,7 @@ function home(probes: Partial<CloudPowerProbes> = {}, onWoke?: () => void, boote
   const power = createCloudPower({ dataDir, now: () => clock, broadcast: (payload) => sent.push(payload), probes: {
     turn: () => state.turn, run: () => state.run, handoff: () => state.handoff, liveCall: () => state.liveCall, computer: () => state.computer,
     maintenance: () => state.maintenance, nextDueAt: () => state.nextDueAt, ...probes,
-  }, onWoke, bootedFromSleep });
+  }, onWoke, bootedFromSleep, onBootWakeRequest });
   powers.push(power);
   /** Moves the clock in ticks, as the 5-second timer would (a single big step is a resume). */
   const pass = (ms: number) => { for (let left = ms; left > 0; left -= 5_000) { clock += Math.min(5_000, left); power.tick(); } };
@@ -52,6 +52,22 @@ describe("telling the Admin it woke", () => {
     expect(plain.power.sleptUntil()).toBe(plain.now());
     plain.pass(10_000);
     expect(woke).toBe(2);
+  });
+
+  it("times only the request that a boot from a stopped sleep was waiting for: never a plain boot's, a resume's or a second one", () => {
+    const requests: number[] = [];
+    const plain = home({}, undefined, false, (at) => requests.push(at));
+    plain.power.arrived("/api/events", {});
+    expect(requests).toEqual([]);
+    const fromSleep = home({}, undefined, true, (at) => requests.push(at));
+    fromSleep.jump(1_200);
+    fromSleep.power.arrived("/api/events", {});
+    fromSleep.power.arrived("/api/sync/changes", {});
+    expect(requests).toEqual([START + 1_200]);
+    fromSleep.pass(5 * 60_000);
+    fromSleep.jump(10 * 60_000);
+    fromSleep.power.arrived("/api/events", {});
+    expect(requests).toEqual([START + 1_200]);
   });
 });
 
@@ -308,5 +324,23 @@ describe("a hand-off between bots", () => {
     h.pass(CLOUD_IDLE_WORK_MS);
     expect(h.power.prepareSleep()).toEqual({ ok: true, nextDueAt: null });
     expect(existsSync(join(h.dataDir, "cloud-sleep.json"))).toBe(true);
+  });
+});
+
+describe("a suspend too short for the clock to notice", () => {
+  it("the request that woke it ends the sleep when it is someone using the home; a background one is still told it sleeps", () => {
+    const { power, pass, jump } = home();
+    pass(CLOUD_IDLE_AWAKE_MS + 5_000);
+    expect(power.prepareSleep()).toMatchObject({ ok: true });
+    jump(12_000);
+    const res = { once: () => {} };
+    const link = "/api/bot-link/sync";
+    power.arrived(link, { "x-omb-background": "1" });
+    power.request(link, { "x-omb-background": "1" }, res as never);
+    expect(power.sleeping()).toBe(true);
+    expect(power.report().lastActivityAt).toBeNull();
+    power.arrived(link, {});
+    power.request(link, {}, res as never);
+    expect(power.sleeping()).toBe(false);
   });
 });

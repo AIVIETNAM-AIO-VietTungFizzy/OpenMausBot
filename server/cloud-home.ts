@@ -7,10 +7,12 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { Surface } from "../shared/wire.ts";
 import { writeFileAtomic } from "./atomic.ts";
+import type { CloudClockGate } from "./cloud-clock.ts";
 import { hostedWorkspaceConfigured } from "./enterprise.ts";
-import { parseMemberClaim, teamRoleScopes, type CloudTeam } from "./cloud-team.ts";
+import { parseMemberClaim, teamMemberEmail, teamRoleScopes, type CloudTeam } from "./cloud-team.ts";
 import { isLoopbackHost } from "./request-auth.ts";
 import { formatPairingCode, type SessionRegistry } from "./sessions.ts";
 
@@ -156,9 +158,21 @@ export function cloudPairingSignature(secret: string, timestamp: string, nonce: 
 export type CloudRequestRefusal = "invalid_signature" | "stale_request" | "replayed_request" | "busy";
 export type CloudRequestVerdict = { ok: true } | { ok: false; status: 401 | 503; error: CloudRequestRefusal };
 
-/** One route's verifier, with its own used nonces. Signature first (constant time), then clock and nonce. Nothing is logged. */
-export function createCloudRequestVerifier(options: { secret: string; now?: () => number }) {
+/**
+ * One route's verifier, with its own used nonces. Signature first (constant time), then clock and nonce. Nothing is logged.
+ *
+ * `clock` (server/cloud-clock.ts): a valid signature whose timestamp is far from this clock makes the home measure its clock
+ * (the timestamp itself is never taken as the time). While a measurement says this clock is off, a timestamp must also fit
+ * the measured true time, so a request signed hours ago that only fits the wrong clock is refused. `tolerant`, for the
+ * Admin's read-only health and power reads only: then fitting the measured true time is enough, so the Admin can still read
+ * a home whose clock a resume left behind. Pairing and anything that changes the home never are.
+ *
+ * Nonces expire on the monotonic clock (`mono`), so a clock set forward never forgets one early. A verifier given only a
+ * `now` (tests) uses it for both.
+ */
+export function createCloudRequestVerifier(options: { secret: string; now?: () => number; mono?: () => number; clock?: CloudClockGate | null; tolerant?: boolean }) {
   const now = options.now ?? Date.now;
+  const mono = options.mono ?? options.now ?? (() => performance.now());
   const nonces = new Map<string, number>();
   return {
     verify(input: { timestamp: string | undefined; nonce: string | undefined; signature: string | undefined; method: string; target: string; body: Buffer | string }): CloudRequestVerdict {
@@ -168,19 +182,22 @@ export function createCloudRequestVerifier(options: { secret: string; now?: () =
       const given = presented ? Buffer.from(presented, "base64url") : Buffer.alloc(expected.length);
       const matches = given.length === expected.length && timingSafeEqual(given, expected);
       if (!presented || !matches || !/^\d{1,12}$/.test(timestamp) || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) return { ok: false, status: 401, error: "invalid_signature" };
-      const at = now();
-      if (Math.abs(at / 1000 - Number(timestamp)) > CLOUD_PAIRING_SKEW_S) return { ok: false, status: 401, error: "stale_request" };
-      for (const [seen, until] of nonces) if (until <= at) nonces.delete(seen);
+      const at = now(), seconds = Number(timestamp);
+      options.clock?.noteSigned(seconds);
+      const local = Math.abs(at / 1000 - seconds) <= CLOUD_PAIRING_SKEW_S, measured = options.clock?.fits(seconds) ?? null;
+      if (!(measured === null ? local : options.tolerant ? measured : local && measured)) return { ok: false, status: 401, error: "stale_request" };
+      const tick = mono();
+      for (const [seen, until] of nonces) if (until <= tick) nonces.delete(seen);
       if (nonces.has(nonce)) return { ok: false, status: 401, error: "replayed_request" };
       if (nonces.size >= MAX_NONCES) return { ok: false, status: 503, error: "busy" };
-      nonces.set(nonce, at + CLOUD_PAIRING_NONCE_MS);
+      nonces.set(nonce, tick + CLOUD_PAIRING_NONCE_MS);
       return { ok: true };
     },
   };
 }
 
 export interface CloudPairingResult {
-  status: 200 | 400 | 401 | 429 | 503;
+  status: 200 | 400 | 401 | 403 | 429 | 503;
   body: Record<string, unknown>;
 }
 
@@ -191,6 +208,13 @@ export function createCloudPairing(options: {
   sessions: PairingSessions;
   /** The team this machine serves: then every pairing body must carry the Admin's `member` claim. */
   team?: CloudTeam | null;
+  /** The team's rule turned remote access off: a User's browser sign-in is refused (an Owner's and an Admin's stay: the
+   * rule is theirs to change, and their admin pages open in a browser). */
+  memberBrowserOff?: () => boolean;
+  /** The claim's `member.invitedBy` (additive): who invited this member, for their welcome (team-welcome.ts). */
+  invited?: (member: string, by: string) => void;
+  /** The home's clock watch (server/cloud-clock.ts): a pairing far from this clock makes it measure; never tolerant. */
+  clock?: CloudClockGate | null;
   now?: () => number;
 }) {
   const { sessions } = options;
@@ -213,6 +237,7 @@ export function createCloudPairing(options: {
       const claim = options.team ? parseMemberClaim(parsed as Record<string, unknown>, options.team) : null;
       if (claim && !claim.ok) return { status: 400, body: { error: claim.error } };
       const member = claim?.ok ? claim.member : null;
+      const invitedBy = member ? teamMemberEmail((parsed as { member?: { invitedBy?: unknown } }).member?.invitedBy) : null;
       // oxlint-disable-next-line no-control-regex
       if (label !== undefined && (typeof label !== "string" || label.length > 80 || /[\x00-\x1f\x7f]/.test(label))) return { status: 400, body: { error: "invalid_label" } };
       if (ttlSeconds !== undefined && (!Number.isSafeInteger(ttlSeconds) || (ttlSeconds as number) < 1)) return { status: 400, body: { error: "invalid_ttl" } };
@@ -222,8 +247,12 @@ export function createCloudPairing(options: {
       if ((browser || owner !== undefined) && (typeof owner !== "string" || owner.length > 254 || !OWNER_EMAIL.test(owner))) {
         return { status: 400, body: { error: "invalid_owner" } };
       }
+      if (browser && member?.role === "member" && options.memberBrowserOff?.()) return { status: 403, body: { error: "remote_access_off" } };
       const ttl = Math.min((ttlSeconds as number | undefined) ?? CLOUD_PAIRING_DEFAULT_TTL_S, browser ? CLOUD_BROWSER_SIGN_IN_MAX_TTL_S : CLOUD_PAIRING_MAX_TTL_S);
       if (member) sessions.revokeMember(member.email, member.role);
+      if (member && invitedBy && invitedBy !== member.email) {
+        try { options.invited?.(member.email, invitedBy); } catch { /* the welcome names nobody; the pairing goes on */ }
+      }
       const opened = sessions.openPairing({
         scopes: member ? teamRoleScopes(member.role) : ["admin", "client"],
         label: typeof label === "string" && label.trim() ? label.trim() : "MausBot Cloud",
